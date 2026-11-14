@@ -47,7 +47,7 @@ What it does **not** defend against, and you should stop pretending otherwise:
 README.md                       this runbook
 LICENSE                         MIT, for the baseline (patches/ stay AGPL-3.0)
 SECURITY-REVIEW.md              operator-impact review of the deployed build (read this first)
-patches/                        the 9 local commits as a patch series against the fork's main
+patches/                        the 10 deployed commits as a patch series against the fork's main
 .env.hardened.example           copy to .env.hardened, fill, chmod 600
 docker-compose.hardened.yml     two services, one bridge, loopback publish only
 nftables/
@@ -231,8 +231,8 @@ docker compose -f docker-compose.hardened.yml exec artex \
 The value you're claiming is "trust this build." That claim is only as good as this list.
 Status recorded 2026-11-14 against the deployed build; evidence in `SECURITY-REVIEW.md`.
 
-- [x] `git log --format='%H %G? %an %ci'` — 9 local commits, all build/UI, all authored by the
-      operator. `G?` is `N` throughout: **unsigned**. Sign them if you are publishing.
+- [x] `git log --format='%H %G? %an %ci'` — 11 local commits, all build/UI, all authored by the
+      operator. All signed with an SSH signing key and **verified** by GitHub (`G? = G`).
 - [ ] Diff against upstream if you have any copy: `git diff --stat upstream/main..HEAD`. Expect
       it confined to `web/` i18n, `agent/prompt.go`, README/docs, and `.env.example`.
       **Could not run — upstream unreachable.** The fork is the only baseline.
