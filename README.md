@@ -45,6 +45,7 @@ What it does **not** defend against, and you should stop pretending otherwise:
 
 ```
 README.md                       this runbook
+LICENSE                         MIT, for the baseline (patches/ stay AGPL-3.0)
 SECURITY-REVIEW.md              operator-impact review of the deployed build (read this first)
 patches/                        the 9 local commits as a patch series against the fork's main
 .env.hardened.example           copy to .env.hardened, fill, chmod 600
