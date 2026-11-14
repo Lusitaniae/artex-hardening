@@ -39,6 +39,7 @@ WPScan stage.
 | Dependency patch is a republish, not a modification | `replace github.com/Autumn-27/norma => github.com/BaaRai/Norma v0.4.4`; `diff -r` against `Autumn-27/norma@v0.4.4` is **empty, byte-identical** | high |
 | Egress in the observed window went only to allowlisted or denied destinations | `artex-access.log`, §5 | medium — one-day window |
 | Build is reproducible from source | tree hash match; bases digest-pinned; every downloaded tool SHA-256-verified; `pip --require-hashes`; `npm ci --ignore-scripts` | high |
+| The deployed commit passes upstream's own test suite | GitHub Actions `ci` run 43564726771 on `b95a57f` — success, 9m47s (Go tests against a real Postgres service) | high |
 
 ## 3. Findings
 
