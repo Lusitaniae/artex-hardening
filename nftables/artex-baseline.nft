@@ -1,0 +1,59 @@
+#!/usr/sbin/nft -f
+#
+# ARTEX "open" baseline: no client scope, full public egress, four footguns closed.
+#
+# This is the "like the original software" mode. It does NOT decide what the agent
+# may attack -- that is the application's job now. It only removes the things that
+# are never legitimate regardless of who the target is:
+#
+#   1. cloud metadata / link-local (169.254.0.0/16, 100.100.100.200, 192.0.0.192)
+#      -- credential theft, not scope
+#   2. RFC1918 outside the lab bridge (10/8, 172.16/12, 192.168/16)
+#      -- on DigitalOcean 10.x is the private VPC and your other droplets live there
+#   3. the lab reaching host services other than the relay and DNS
+#      -- otherwise the agent can knock on sshd (it can today: 172.18.0.1:22 is open)
+#   4. everything is logged, so "what did it contact" survives with no allowlist
+#
+# Apply with: sudo ./scripts/egress-apply.sh --open
+# The kernel scope table (inet artex) is removed by that command. `--revert` also
+# removes this table; `egress-apply.sh` without flags restores scoped mode.
+#
+# 172.28.0.0/24 and 172.28.0.1 are rendered from SUBNET/GATEWAY at apply time.
+
+table inet artex_baseline
+delete table inet artex_baseline
+
+table inet artex_baseline {
+
+    set lab_net {
+        type ipv4_addr
+        flags interval
+        # populated by egress-apply.sh from SUBNET
+    }
+
+    chain forwarded {
+        type filter hook forward priority filter - 5; policy accept;
+
+        # 1. metadata / link-local, before anything can accept it
+        ip saddr @lab_net ip daddr 169.254.0.0/16 counter log prefix "ARTEX-BASE-META " drop
+        ip saddr @lab_net ip daddr { 100.100.100.200, 192.0.0.192 } counter log prefix "ARTEX-BASE-META " drop
+
+        # 2. private space outside the lab. The lab itself stays allowed here;
+        #    Docker's own rules govern it.
+        ip saddr @lab_net ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } \
+            ip daddr != @lab_net counter log prefix "ARTEX-BASE-PRIVATE " drop
+    }
+
+    chain input {
+        type filter hook input priority filter - 5; policy accept;
+
+        # 3. the only host services the lab may reach
+        iifname != "lo" ip saddr @lab_net tcp dport 3128 accept
+        iifname != "lo" ip saddr @lab_net udp dport 53 accept
+        iifname != "lo" ip saddr @lab_net tcp dport 53 accept
+
+        # everything else the lab aims at the host: sshd, docker API, future services
+        iifname != "lo" ip saddr @lab_net ct state new \
+            counter log prefix "ARTEX-BASE-HOST " drop
+    }
+}

@@ -1,0 +1,14 @@
+# LLM provider egress IPs — used ONLY in `egress-apply.sh --direct` mode.
+#
+# Why this is the fragile mode: most providers front their API with a CDN or
+# anycast, so these addresses rotate without notice and your run dies mid-engagement
+# with a TLS timeout that looks like a provider outage.
+#
+# Preferred: leave this empty and use the default proxy mode, where
+# proxy/squid.conf enforces a *domain* allowlist and IP rotation is irrelevant.
+#
+# If you must pin IPs, resolve them immediately before the run and re-check after:
+#   getent ahostsv4 api.deepseek.com | awk '{print $1"/32"}'
+#
+# api.deepseek.com:
+# 203.0.113.0/32

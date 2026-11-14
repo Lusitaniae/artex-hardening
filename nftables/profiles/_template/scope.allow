@@ -1,0 +1,12 @@
+# In-scope engagement targets for THIS assignment. One CIDR or IP per line.
+# Copy nftables/profiles/_template to nftables/profiles/<engagement>/ first.
+#
+# Fill from the signed scope document, not from memory. One line per entry:
+#   <cidr>   # <host> — <evidence one-liner>
+#
+# /32 by default. /24 is the maximum for a shared-ASN host. A larger prefix only
+# for a client-owned netblock proven by RDAP, with the evidence on the line.
+#
+# Example (replace):
+# 203.0.113.10/32   # web app prod-facing — cert SAN + client scope doc §2.1
+# 198.51.100.0/28   # staging cluster — RDAP netblock is client-owned

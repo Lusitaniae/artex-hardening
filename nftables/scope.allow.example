@@ -1,0 +1,16 @@
+# In-scope engagement targets. ONE CIDR OR IP PER LINE. Comments with #.
+#
+# This file is the authoritative scope boundary enforced by the kernel.
+# It is not a wish list and not a reminder — if it is in here, the agent can reach it.
+#
+# Rules of thumb:
+#   - Copy from the signed scope document, not from memory.
+#   - Prefer /32 and /32 aggregates. Never a /16 "to be safe".
+#   - Exclude shared infrastructure (load balancers, client cloud metadata, mail relays)
+#     unless the client explicitly included it in writing.
+#   - Put the client's own corporate ranges in here ONLY if they are in scope.
+#
+# Example:
+# 203.0.113.10/32      # web app prod-facing
+# 203.0.113.0/28       # staging cluster
+# 198.51.100.0/28      # vpn egress range the client confirmed

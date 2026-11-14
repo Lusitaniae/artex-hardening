@@ -1,0 +1,50 @@
+# CDN edge — reachable ONLY through the allowlisting relay (squid), never
+# directly from the lab. Populated 2026-11-08 on explicit operator instruction:
+# "allow cloudflare, gitbook, fastly for exploration".
+#
+# Why this is separate from scope.allow: the lab (in_scope) stays on the client's hosting provider only,
+# so a tool that ignores HTTP_PROXY cannot reach the CDN. squid's dstdomain ACL is
+# what narrows ~1.9M shared-edge addresses back down to the client's names.
+#
+# GitBook is not a network: gitbook.io, api./app./hosting.gitbook.io and the
+# client's docs host all resolve into the Cloudflare prefixes below.
+#
+# Cloudflare AS13335 — 15 prefixes, 1,524,736 addrs — https://www.cloudflare.com/ips-v4
+173.245.48.0/20
+103.21.244.0/22
+103.22.200.0/22
+103.31.4.0/22
+141.101.64.0/18
+108.162.192.0/18
+190.93.240.0/20
+188.114.96.0/20
+197.234.240.0/22
+198.41.128.0/17
+162.158.0.0/15
+104.16.0.0/13
+104.24.0.0/14
+172.64.0.0/13
+131.0.72.0/22
+
+# Fastly AS54113 — 21 prefixes, 353,280 addrs — https://api.fastly.com/public-ip-list
+23.235.32.0/20
+43.249.72.0/22
+90.98.0.0/17
+90.98.128.0/18
+103.244.50.0/24
+103.245.222.0/23
+103.245.224.0/24
+104.156.80.0/20
+140.248.64.0/18
+140.248.128.0/17
+146.75.0.0/17
+151.101.0.0/16
+157.52.64.0/18
+167.82.0.0/17
+167.82.128.0/20
+167.82.160.0/20
+167.82.224.0/20
+172.111.64.0/18
+185.31.16.0/22
+199.27.72.0/21
+199.232.0.0/16

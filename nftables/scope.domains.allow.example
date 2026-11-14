@@ -1,0 +1,20 @@
+# Name-level engagement scope for the egress relay (squid `scope_domains` ACL).
+#
+# One domain per line. An entry `example.com` is rendered as
+# `acl scope_domains dstdomain .example.com`, which matches example.com and all of
+# its subdomains. No leading dot, no scheme, no path.
+#
+# Copy to nftables/scope.domains.allow (gitignored) or to
+# nftables/profiles/<engagement>/scope.domains.allow, then run:
+#   ./scripts/render-squid-scope.sh --profile <engagement>
+#
+# WHY THIS IS A GENERATED FILE AND NOT A TRACKED ONE: the domain list names the
+# client. It is engagement-confidential in exactly the way nftables/scope.allow is,
+# and keeping it out of the repo means a fork or a publish cannot leak the target.
+#
+# EMPTY IS THE DEFAULT AND MEANS DENY. With no entries the ACL matches nothing and
+# every scope-domain request is refused — the same posture as the empty nftables sets.
+#
+# example:
+#   client.example
+#   docs.client.example

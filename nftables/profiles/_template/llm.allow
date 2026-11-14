@@ -1,0 +1,7 @@
+# LLM provider egress IPs — used ONLY in `egress-apply.sh --direct` mode.
+#
+# Preferred: leave empty and use proxy mode, where squid enforces a domain
+# allowlist and provider IP rotation is irrelevant.
+#
+# If you must pin: resolve immediately before the run and re-check after.
+#   getent ahostsv4 api.deepseek.com | awk '{print $1"/32"}'

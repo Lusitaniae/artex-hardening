@@ -1,0 +1,11 @@
+# Shared CDN prefixes for THIS assignment. Reachable only through the relay,
+# never directly from the lab (the kernel drops @lab_net -> @cdn_edge and logs
+# ARTEX-CDN-DIRECT).
+#
+# Populate only from the vendor's published list, only for CDNs the client's names
+# actually sit behind, and only when a tool ignoring HTTP_PROXY must still work.
+# Prefer adding names to scope_domains in proxy/squid.conf: a name survives IP
+# rotation and is narrower by construction.
+#
+# Cloudflare: https://www.cloudflare.com/ips-v4
+# Fastly:     https://api.fastly.com/public-ip-list

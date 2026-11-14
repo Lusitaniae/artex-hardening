@@ -1,0 +1,110 @@
+# ARTEX hardened deployment.
+#
+# Design rules:
+#   - digest-pinned images, pull_policy: never  -> no silent code changes mid-engagement
+#   - one bridge (172.28.0.0/24), no published DB port, app published to loopback only
+#   - cap_drop ALL, no-new-privileges, pids/mem limits, log rotation
+#   - egress is default-deny in nftables (see nftables/artex-egress.nft), not here
+#
+# Verify assumptions A1-A5 in README §3 against your pinned commit before first run.
+
+name: artex-hardened
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "3"
+
+services:
+  db:
+    image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE must be digest-pinned (see scripts/pin-digests.sh)}
+    pull_policy: never
+    <<: *hardening
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-artex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-artex}
+      # No extensions, no external access. Postgres never leaves the bridge.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - lab
+    cap_drop:
+      - ALL
+    cap_add:
+      # postgres:17-alpine's entrypoint needs these to chown the data dir and
+      # drop from root to the postgres user. Nothing else is granted.
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+    pids_limit: 512
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-artex} -d ${POSTGRES_DB:-artex}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  artex:
+    image: ${ARTEX_IMAGE:?ARTEX_IMAGE must be a locally-built, commit-tagged image}
+    pull_policy: never
+    <<: *hardening
+    # restart: "no" on purpose — the binary ships its own supervisor (start.sh).
+    # Two supervisors fighting produces restart loops that hide the real crash.
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env.hardened
+    environment:
+      # ASSUMPTION A4: db reachable as host "db" on 5432.
+      ARTEX_PG_DSN: >-
+        postgres://${POSTGRES_USER:-artex}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-artex}?sslmode=disable
+    ports:
+      # Loopback only. 8788 (traffic-recording proxy) is deliberately NOT published:
+      # it records cookies, tokens and request bodies. Tunnel to it if you truly need it.
+      - "127.0.0.1:8787:8787"
+    volumes:
+      # ASSUMPTION A3: writable state path. Adjust to the real path for your build.
+      - artex_state:${ARTEX_STATE_DIR:-/opt/artex/state}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+    read_only: false
+    # If you want read_only: true, first prove the binary writes nowhere else:
+    #   docker run --rm --read-only --tmpfs /tmp artex-hardened:<sha> ...
+    # then mount every writable path explicitly. Do not guess.
+    cap_drop:
+      - ALL
+    pids_limit: 2048
+    mem_limit: 4g
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 16384
+    networks:
+      - lab
+
+networks:
+  lab:
+    driver: bridge
+    enable_ipv6: false
+    ipam:
+      config:
+        # Fixed subnet: the nftables ruleset matches on this exact range.
+        # Change both, or the firewall silently stops applying.
+        - subnet: 172.28.0.0/24
+          gateway: 172.28.0.1
+
+volumes:
+  db_data:
+  artex_state:

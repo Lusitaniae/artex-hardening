@@ -1,0 +1,13 @@
+[Unit]
+Description=ARTEX lab DNS forwarder with query logging
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/artex-dnsmasq.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

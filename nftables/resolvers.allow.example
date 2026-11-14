@@ -1,0 +1,6 @@
+# DNS resolvers the lab containers may query.
+# Keep this to exactly one resolver you can later read the query log from.
+# A public resolver is acceptable; a rotating list is not — it widens the exfil channel.
+#
+# 1.1.1.1
+# 9.9.9.9

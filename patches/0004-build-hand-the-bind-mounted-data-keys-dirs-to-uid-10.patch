@@ -1,0 +1,151 @@
+From 47165a9f63dd9f8684874b9f0491602a8037795c Mon Sep 17 00:00:00 2001
+From: hardening <hardening@example.invalid>
+Date: Sat, 7 Nov 2026 10:39:32 +0000
+Subject: [PATCH 4/9] build: hand the bind-mounted data/keys dirs to uid 10001
+ at startup
+
+The unprivileged-user change made `docker compose up` fail on a fresh clone:
+compose bind-mounts ./data and ./keys, the Docker daemon creates missing host
+directories as root:root, so uid 10001 could not create /app/data/traffic or
+write /app/keys/jwt.key. artex exited with code 1 and start.sh's supervisor
+looped on the restart backoff.
+
+docker-entrypoint.sh now runs as root under compose (which sets user: "0:0"),
+chowns only the two writable volumes (and only entries that are not already
+10001:10001, so restarts do not rewrite a large data tree), then drops to
+uid 10001 with setpriv. /app/artex and /app/skills stay root-owned and
+read-only, so a compromised agent still cannot rewrite the binary or skills.
+The image default stays USER artex, so plain `docker run` without host bind
+mounts and Kubernetes runAsNonRoot skip the handover entirely.
+
+Verified locally: docker build + docker compose up -d --no-build, postgres and
+artex healthy, GET / -> 200, and inside the container pid 1 and artex run as
+uid 10001 while writes to /app/skills and /app/artex are denied.
+---
+ Dockerfile           | 11 +++++++++--
+ HARDENING.md         | 19 +++++++++++++++----
+ docker-compose.yml   |  4 ++++
+ docker-entrypoint.sh | 30 ++++++++++++++++++++++++++++++
+ 4 files changed, 58 insertions(+), 6 deletions(-)
+ create mode 100755 docker-entrypoint.sh
+
+diff --git a/Dockerfile b/Dockerfile
+index 632637e..32273c5 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -182,7 +182,9 @@ COPY --from=build /out/artex /app/artex
+ # to artex — docker stop only signals PID 1; without forwarding, artex never receives it,
+ # cannot shut down gracefully, and is hard-killed by SIGKILL after 10 seconds.
+ COPY start.sh /app/start.sh
+-RUN chmod +x /app/artex /app/start.sh && mkdir -p /app/keys /app/data
++COPY docker-entrypoint.sh /app/docker-entrypoint.sh
++RUN chmod +x /app/artex /app/start.sh /app/docker-entrypoint.sh \
++    && mkdir -p /app/keys /app/data
+ 
+ # persistence points: data/ (SQLite, task files) and keys/ (jwt.key, via ARTEX_JWT_KEY_DIR)
+ # Only the writable paths are handed to the runtime user; the binary and skills stay
+@@ -196,6 +198,11 @@ COPY skills/ /app/skills/
+ VOLUME ["/app/data", "/app/keys"]
+ EXPOSE 8787 8788
+ ENV HOME=/home/artex
++# Default user is unprivileged. docker-compose.yml overrides this with `user: "0:0"`
++# because it bind-mounts ./data and ./keys from the host (created root-owned by the
++# daemon); the entrypoint then chowns those two paths and drops back to uid 10001
++# with setpriv before artex runs. A plain `docker run` without host bind mounts, and
++# `kubectl` with runAsNonRoot, use uid 10001 directly and skip the handover.
+ USER artex
+-ENTRYPOINT ["/app/start.sh"]
++ENTRYPOINT ["/app/docker-entrypoint.sh"]
+ CMD ["-addr", ":8787", "-proxy", ":8788"]
+diff --git a/HARDENING.md b/HARDENING.md
+index 5c8342b..f515258 100644
+--- a/HARDENING.md
++++ b/HARDENING.md
+@@ -36,6 +36,10 @@ scripts/verify-provenance.sh release BaaRai/ARTEX v0.5.1 artex-0.5.1-linux-amd64
+    Playwright packages are pinned to exact versions instead of `@latest`.
+ 4. **Container runs unprivileged** (`uid 10001`). `/app/artex` and `/app/skills` stay
+    root-owned and read-only; only `/app/data` and `/app/keys` are writable.
++   Under compose, `docker-entrypoint.sh` starts as root, hands those two volumes to
++   `uid 10001` (compose bind-mounts them from the host, where the daemon creates them
++   root-owned) and then `exec`s `setpriv --reuid=10001 --regid=10001`; artex and the
++   agents it spawns never run as root.
+ 5. **Base images pinned by digest** — `python:3.12-slim-bookworm`, `node:22-bookworm-slim`
+    and `golang:1.26-bookworm` are referenced by multi-arch index digest, so a re-tagged
+    base image cannot change what is built.
+@@ -54,6 +58,13 @@ scripts/verify-provenance.sh release BaaRai/ARTEX v0.5.1 artex-0.5.1-linux-amd64
+   the flag and preinstall only the modules you use from your own locked list.
+ - The image build is not byte-reproducible (apt/pip/npm fetch at build time, and
+   `npm ci` resolves from the lockfile's registry URLs).
++- PID 1 of the container starts as root for the `/app/data` + `/app/keys` ownership
++  handover before dropping to `uid 10001`. This only happens under `docker-compose.yml`,
++  which sets `user: "0:0"` because it bind-mounts those paths from the host; the image
++  default is `USER artex`, so `docker run` without host bind mounts (and
++  `runAsNonRoot` in Kubernetes) start directly as `uid 10001`. Running the compose file
++  with `--user 10001` skips the handover, and then the host directories must already be
++  owned by `10001:10001`.
+ - The `bot.yml` workflow sends issue/PR text to DeepSeek and holds a token with
+   `issues: write`. It cannot push code (`contents: read`). Delete that workflow in a
+   private fork if you don't want it.
+@@ -70,7 +81,7 @@ git rebase --onto origin/v0.x.y <old-upstream-tag> hardening/local
+ If this fork is ever served to other people over a network, AGPL-3.0 §13 requires
+ offering them the corresponding source of the modified version.
+ 
+-> Status: these Dockerfile changes were **not built** in the environment where they
+-> were written (no Docker available). Validate with `docker build .` before relying on
+-> them; the hash values come from each vendor's published checksums file and are
+-> correct as of the versions pinned above.
++> Status: the image builds and runs. Verified locally with `docker build -t artex:local .`
++> plus `docker compose up -d --no-build` (postgres + artex healthy, UI answering on
++> 127.0.0.1:8787), and the pinned hashes/images were resolved during that build. Re-verify
++> after changing any version pin: `docker build --progress=plain -t artex:local .`.
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 3870ea7..f513a1f 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -23,6 +23,10 @@ services:
+       args:
+         ARTEX_VERSION: ${ARTEX_VERSION:-dev}
+     image: artex:local
++    # The image runs as uid 10001. Start it as root so docker-entrypoint.sh can hand
++    # the bind-mounted ./data and ./keys (created root-owned by the daemon) to that
++    # user; the entrypoint then drops privileges, so artex itself is never root.
++    user: "0:0"
+     depends_on:
+       postgres:
+         condition: service_healthy
+diff --git a/docker-entrypoint.sh b/docker-entrypoint.sh
+new file mode 100755
+index 0000000..1528649
+--- /dev/null
++++ b/docker-entrypoint.sh
+@@ -0,0 +1,30 @@
++#!/bin/sh
++# Docker entrypoint (container only; local installs use ./start.sh directly).
++#
++# The runtime user is uid 10001 (see Dockerfile), but docker-compose bind-mounts
++# ./data and ./keys from the host, and the Docker daemon creates missing host
++# directories as root:root. Without a handover the unprivileged user cannot write
++# the SQLite/task data or the JWT key, and artex exits on startup.
++#
++# So PID 1 starts as root, gives away *only* the two writable volumes, and then
++# drops to uid 10001 before artex runs. /app/artex and /app/skills stay root-owned
++# and read-only: a compromised agent process still cannot rewrite the binary or the
++# skills, which is the property the unprivileged user exists for.
++set -eu
++
++APP_UID=10001
++APP_GID=10001
++
++if [ "$(id -u)" = "0" ]; then
++	for d in /app/data /app/keys; do
++		mkdir -p "$d"
++		# Chown only entries that are not already ours (a `chown -R` on every start
++		# would rewrite a large data/ tree on each container restart). -h keeps
++		# symlinks themselves from being followed out of the volume.
++		find "$d" \( ! -uid "$APP_UID" -o ! -gid "$APP_GID" \) \
++			-exec chown -h "$APP_UID:$APP_GID" {} + 2>/dev/null || true
++	done
++	exec setpriv --reuid="$APP_UID" --regid="$APP_GID" --init-groups -- "$0" "$@"
++fi
++
++exec /app/start.sh "$@"

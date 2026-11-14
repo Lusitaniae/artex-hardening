@@ -1,0 +1,157 @@
+From b95a57fdc89c55529cbbb026a90c8d5e029ad16b Mon Sep 17 00:00:00 2001
+From: hardening <hardening@example.invalid>
+Date: Sat, 14 Nov 2026 06:03:03 +0000
+Subject: [PATCH] build: wpscan stage, no-egress bbot dry-run, pinned image and
+ static db address
+
+---
+ Dockerfile         | 49 +++++++++++++++++++++++++++++++++++++++++++++-
+ docker-compose.yml | 36 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 83 insertions(+), 2 deletions(-)
+
+diff --git a/Dockerfile b/Dockerfile
+index 5b812b3..d84bc3c 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -81,7 +81,7 @@ RUN set -eux; \
+     PIP_NO_CACHE_DIR=1 bbot -y --install-all-deps; \
+     bbot --version >/dev/null; \
+     bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness >/dev/null 2>&1 || true; \
+-    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness --no-color >/tmp/bbot-dry.log 2>&1 || true; \
++    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness >/tmp/bbot-dry.log 2>&1 || true; \
+     ! grep -qE "Installing|ERRR|CRITICAL" /tmp/bbot-dry.log || { cat /tmp/bbot-dry.log; exit 1; }; \
+     # Keep the core-dep marker, the ansible collection and the bbot config; drop the
+     # tool cache (~1.5 GB of a second chrome/node/jadx/trufflehog) and run leftovers.
+@@ -182,6 +182,23 @@ RUN set -eux; \
+     nuclei -version >/dev/null; httpx -version; subfinder -version; katana -version; \
+     ffuf -V >/dev/null; dalfox --version >/dev/null 2>&1 || true; sqlmap --version >/dev/null
+ 
++# ------------------------------------------------------------------ wpscan ---
++# WordPress enumeration, with its metadata DB baked so `wpscan --url` works with no
++# egress and no `--update`. The CLI is installed system-wide; the API token is NOT
++# baked into any layer. /usr/local/bin/wpscan is a thin wrapper that injects
++# --api-token from $WPSCAN_API_TOKEN at exec time, so the token never appears in a
++# command line, a task prompt, an activity row, or a model context window.
++ARG WPSCAN_VERSION=3.8.28
++RUN set -eux; \
++    apt-get update; \
++    apt-get install -y --no-install-recommends ruby ruby-dev build-essential \
++      libcurl4-openssl-dev libxml2-dev libxslt1-dev zlib1g-dev; \
++    gem install wpscan -v "$WPSCAN_VERSION" --no-document; \
++    apt-get purge -y --auto-remove ruby-dev build-essential \
++      libcurl4-openssl-dev libxml2-dev libxslt1-dev zlib1g-dev; \
++    rm -rf /var/lib/apt/lists/* /root/.gem; \
++    wpscan --version | grep -i "current version"
++
+ # bbot recursive recon orchestrator (#117): blacklanternsecurity/bbot, AGPL-3.0
+ # (same license as ARTEX; standalone CLI dependency, not linked code). Own venv to
+ # isolate it from the image python, installed from a fully hashed lock
+@@ -262,6 +279,36 @@ RUN set -eux; \
+     count="$(find /home/artex/nuclei-templates -name "*.yaml" | wc -l)"; \
+     echo "baked nuclei templates: $count"; \
+     test "$count" -gt 10000
++# ------------------------------------------------- wpscan wrapper + metadata ---
++# Wrapper first: the gem binstub moves aside to wpscan.real and this reads the token
++# from the environment at exec time. `--api-token` present in the caller's argv wins,
++# so an explicit token is still possible.
++RUN set -eux; \
++    mv /usr/local/bin/wpscan /usr/local/bin/wpscan.real; \
++    printf '%s\n' \
++      '#!/bin/sh' \
++      '# Inject the WPScan API token without putting it on the command line.' \
++      'case " $* " in' \
++      '  *" --api-token "*) exec /usr/local/bin/wpscan.real "$@" ;;' \
++      'esac' \
++      'if [ -n "${WPSCAN_API_TOKEN:-}" ]; then' \
++      '  exec /usr/local/bin/wpscan.real --api-token "$WPSCAN_API_TOKEN" "$@"' \
++      'fi' \
++      'exec /usr/local/bin/wpscan.real "$@"' \
++      > /usr/local/bin/wpscan; \
++    chmod 0755 /usr/local/bin/wpscan; \
++    /usr/local/bin/wpscan --version | grep -i "current version"
++
++# Bake the metadata DB (plugins/themes/core/wordlists) as the runtime user. Without
++# it wpscan only has heuristic detection, and `--update` needs egress that a scoped
++# engagement does not have.
++RUN set -eux; \
++    HOME=/home/artex wpscan --update --no-banner >/dev/null 2>&1 || \
++      HOME=/home/artex wpscan --update --no-banner; \
++    test -d /home/artex/.wpscan/db; \
++    chown -R artex:artex /home/artex/.wpscan; \
++    find /home/artex/.wpscan/db -type f | wc -l
++
+ COPY skills/ /app/skills/
+ VOLUME ["/app/data", "/app/keys"]
+ EXPOSE 8787 8788
+diff --git a/docker-compose.yml b/docker-compose.yml
+index f513a1f..59ab560 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -13,6 +13,12 @@ services:
+       timeout: 3s
+       retries: 10
+     restart: unless-stopped
++    # Static IP: ARTEX_PG_DSN, dnsmasq host-record and extra_hosts all name this
++    # address. Letting Docker allocate it means a stack down/up could move it and
++    # silently break the app (see 2026-11-08 DNS incident).
++    networks:
++      default:
++        ipv4_address: 172.18.0.2
+ 
+   artex:
+     # Built from this checkout. The previous reference was a third-party
+@@ -22,11 +28,22 @@ services:
+       context: .
+       args:
+         ARTEX_VERSION: ${ARTEX_VERSION:-dev}
+-    image: artex:local
++    # Pinned by digest, not tag. Built 2026-11-08 from 0e1a87a (gzip/ETag +
++    # logo/WebP fixes on top of 6df68b1). Tag would let the registry move under us.
++    # Derived from that digest + WPScan (built 2026-11-08); base digest recorded in Dockerfile.wpscan.
++    image: artex:local-20261109
+     # The image runs as uid 10001. Start it as root so docker-entrypoint.sh can hand
+     # the bind-mounted ./data and ./keys (created root-owned by the daemon) to that
+     # user; the entrypoint then drops privileges, so artex itself is never root.
+     user: "0:0"
++    # All container DNS goes through the host logging forwarder (artex-dns),
++    # query log at /var/log/artex-dns.log.
++    dns:
++      - 172.18.0.1
++    # Belt-and-braces for the DB hostname: dnsmasq has a host-record too, but
++    # /etc/hosts is consulted first and survives a dnsmasq outage.
++    extra_hosts:
++      - "postgres:172.18.0.2"
+     depends_on:
+       postgres:
+         condition: service_healthy
+@@ -40,6 +57,11 @@ services:
+       ARTEX_LLM_PROXY: ${ARTEX_LLM_PROXY:-}
+       ARTEX_JWT_KEY_DIR: /app/keys
+       ARTEX_TRUSTED_PROXIES: ${ARTEX_TRUSTED_PROXIES:-}
++      # ProjectDiscovery CLIs (nuclei/httpx/katana/subfinder) otherwise call api.pdtm.sh
++      # on startup. Out-of-scope egress; silent update check, disabled 2026-11-09.
++      DISABLE_UPDATE_CHECK: "true"
++      # WPScan API token: read by /usr/local/bin/wpscan, never passed on a command line.
++      WPSCAN_API_TOKEN: ${WPSCAN_API_TOKEN:-}
+     ports:
+       - "${ARTEX_BIND_ADDR:-127.0.0.1}:8787:8787"
+       - "127.0.0.1:8788:8788"
+@@ -54,6 +76,18 @@ services:
+       # skill changes require no image rebuild — the container reads the host copy.
+       - ./skills:/app/skills
+     restart: unless-stopped
++    networks:
++      default:
++        ipv4_address: 172.18.0.3
+ 
+ volumes:
+   pgdata:
++
++networks:
++  default:
++    # Deployment-specific: this stack runs on 172.18.0.0/16. The hardened
++    # reference compose uses 172.28.0.0/24 — keep nftables/egress.env in sync.
++    ipam:
++      config:
++        - subnet: 172.18.0.0/16
++          gateway: 172.18.0.1

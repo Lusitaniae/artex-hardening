@@ -1,0 +1,5 @@
+# DNS resolvers the lab may query for THIS assignment.
+# Exactly one resolver you control or a well-known one whose query log you can
+# read afterwards. A rotating list is an exfil channel, not a resolver list.
+#
+# 1.1.1.1

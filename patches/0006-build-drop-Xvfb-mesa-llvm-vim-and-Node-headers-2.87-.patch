@@ -1,0 +1,83 @@
+From 6df68b15d6bf5500e30ada590498319c48c170b9 Mon Sep 17 00:00:00 2001
+From: hardening <hardening@example.invalid>
+Date: Sat, 7 Nov 2026 11:27:06 +0000
+Subject: [PATCH 6/9] build: drop Xvfb/mesa/llvm, vim and Node headers (2.87 ->
+ 2.58 GB)
+
+Everything here is dead weight for a headless-only image:
+
+- Xvfb + mesa (libgl1-mesa-dri -> libLLVM-15, 112 MB, plus 25 MB of dri drivers)
+  are installed by `playwright install --with-deps` for headed rendering. ARTEX
+  launches @playwright/mcp with --headless and the headless shell renders through
+  its bundled SwiftShader. Verified after removal: screenshot of a rendered page
+  and a live WebGL context both still work, as uid 10001 -> 173 MB.
+- vim + vim-runtime: 43 MB, no skill invokes it (grep over skills/ is empty; the
+  agents use cat/sed/python).
+- Node headers copied along with the Node binary from the build stage: 7 MB.
+
+Not touched, because they are functional rather than leftover: /opt/bbot 508 MB,
+/ms-playwright 288 MB, the six Go recon tools ~436 MB (already stripped, nuclei
+alone is 177 MB), Node 124 MB, Python 3.12. Going lower means giving up a
+capability (see HARDENING.md for the three options).
+
+Verified: compose stack healthy, GET / -> 200, bbot dry-run 14/14 modules as
+uid 10001, nmap/git/nuclei still present.
+---
+ Dockerfile   | 11 +++++++++--
+ HARDENING.md | 17 +++++++++++++----
+ 2 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/Dockerfile b/Dockerfile
+index e921215..0b01bbe 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -100,7 +100,7 @@ ARG TARGETARCH
+ COPY --from=web /usr/local /usr/local
+ 
+ RUN apt-get update && apt-get install -y --no-install-recommends \
+-      ca-certificates ripgrep curl wget vim git jq unzip \
++      ca-certificates ripgrep curl wget git jq unzip \
+       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
+       p7zip-full xz-utils \
+     && rm -rf /var/lib/apt/lists/* \
+@@ -214,7 +214,14 @@ RUN npm install -g --no-fund --no-audit \
+     # headless Chromium runs the chromium-headless-shell build, so the ~420 MB headed
+     # Chromium never starts. Drop it; ffmpeg stays (screenshots/video need it).
+     && playwright install --with-deps --only-shell chromium \
+-    && rm -rf /var/lib/apt/lists/* /root/.npm /root/.cache/node
++    # --with-deps also pulls Xvfb and mesa for headed rendering: libgl1-mesa-dri
++    # drags in libLLVM-15 (112 MB) plus 25 MB of dri drivers. Headless Chromium
++    # renders through the bundled SwiftShader instead; verified that screenshots and
++    # a WebGL context still work with all of it removed (~170 MB).
++    && apt-get purge -y -qq xvfb libgl1-mesa-dri libglx-mesa0 libgl1 libglx0 \
++    && apt-get autoremove -y -qq --purge \
++    && rm -rf /var/lib/apt/lists/* /var/cache/apt \
++              /root/.npm /root/.cache/node /usr/local/include/node
+ 
+ WORKDIR /app
+ # Binary compiled from source in the build stage above.
+diff --git a/HARDENING.md b/HARDENING.md
+index 9e9e601..3810de8 100644
+--- a/HARDENING.md
++++ b/HARDENING.md
+@@ -114,7 +114,16 @@ offering them the corresponding source of the modified version.
+ > 127.0.0.1:8787, bbot 3.0.2 running as uid 10001). Re-verify after changing any version
+ > pin: `docker build --progress=plain -t artex:local .`
+ >
+-> Size: 6.49 GB → 2.87 GB (`docker system df -v`). Removed: 1.5 GB of bbot build junk in
+-> `/root` (tool cache + gcc/make/libssl-dev/ansible installs), 92 MB pip cache, 55 MB npm
+-> cache, and the 422 MB headed Chromium that `--headless` never starts. `/usr` also drops
+-> from 1.70 GB to 1.12 GB now that bbot's build tooling stays in the `bbotdeps` stage.
++> Size: 6.49 GB → 2.58 GB (`docker system df -v`; 1.83 GB measured with `du`). Removed:
++> 1.5 GB of bbot build junk in `/root` (tool cache + gcc/make/libssl-dev/ansible installs),
++> 92 MB pip cache, 55 MB npm cache, the 422 MB headed Chromium that `--headless` never
++> starts, 173 MB of Xvfb/mesa/libLLVM-15 that `--with-deps` installs for headed rendering
++> (headless Chromium uses the bundled SwiftShader; screenshots and WebGL verified after
++> removal), ~43 MB of `vim` + vim-runtime (no skill invokes it), and 7 MB of Node headers.
++>
++> What is left is mostly functional: `/opt/bbot` 508 MB (of which 234 MB is the unpinned
++> module deps above), `/ms-playwright` 288 MB (headless shell + ffmpeg), the six Go tools
++> in `/usr/local/bin` ~436 MB (already stripped; nuclei alone is 177 MB), Node 124 MB and
++> Python 3.12. The three ways to go lower are capability trades, not cleanup: install bbot
++> module deps only for the modules the skill uses (-234 MB, breaks ad-hoc modules), drop
++> bbot (-508 MB), or drop the browser MCP (-412 MB for Playwright + Node).

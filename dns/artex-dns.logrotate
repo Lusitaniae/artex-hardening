@@ -1,0 +1,12 @@
+/var/log/artex-dns.log {
+    # /var/log is root:syslog 775; logrotate refuses without this.
+    su root syslog
+    daily
+    rotate 7
+    maxsize 50M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

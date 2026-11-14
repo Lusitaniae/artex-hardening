@@ -1,0 +1,27 @@
+# Apply the egress containment ruleset at boot.
+#
+# Without this, `scripts/egress-apply.sh` only changes the running kernel: the
+# next reboot comes up with the agent uncontained and nothing to tell you.
+#
+#   install -m 0644 nftables/artex-egress.service /etc/systemd/system/
+#   install -m 0600 nftables/egress.env.example /etc/artex/egress.env
+#   systemctl daemon-reload && systemctl enable --now artex-egress.service
+#
+# Switch to proxy mode (squid relay) by changing --direct to --proxy below.
+
+[Unit]
+Description=ARTEX egress containment (nftables default-deny)
+DefaultDependencies=no
+After=network-pre.target
+Before=docker.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/artex/egress.env
+WorkingDirectory=/root/artex-hardening
+ExecStart=/root/artex-hardening/scripts/egress-apply.sh --direct
+
+[Install]
+WantedBy=multi-user.target

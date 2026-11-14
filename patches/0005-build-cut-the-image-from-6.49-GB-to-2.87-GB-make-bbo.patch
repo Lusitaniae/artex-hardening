@@ -1,0 +1,351 @@
+From 46242bab5e571a61dbd115260920e876cb6eda02 Mon Sep 17 00:00:00 2001
+From: hardening <hardening@example.invalid>
+Date: Sat, 7 Nov 2026 11:16:10 +0000
+Subject: [PATCH 5/9] build: cut the image from 6.49 GB to 2.87 GB; make bbot
+ work unprivileged
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Five changes, all verified against a built image:
+
+1. bbot moved into a throwaway `bbotdeps` stage. `--install-all-deps` apt-installs
+   gcc/make/libssl-dev/7z/xz, pip-installs 40 module packages and runs ansible-galaxy;
+   its dry-run also downloads bbot's per-module tool cache into $HOME: a second
+   Chromium (693 MB), a second Node (164 MB), jadx (110 MB), trufflehog, gowitness,
+   trajan, retirejs — 1.5 GB. None of it was usable: it lived in /root, which the
+   runtime user (uid 10001) cannot read. Only /opt/bbot plus bbot's config is copied.
+
+2. bbot's prepared home is seeded under /home/artex instead. Without a core-dep marker
+   in ~/.bbot/cache, bbot's installer shells out to `sudo` for apt; the image has no
+   sudo and bbot catches only CalledProcessError, so a scan died with
+   FileNotFoundError. The build now writes the marker, bbot.yml/secrets.yml and the
+   ansible collection as the runtime user's files, and the runtime hands them over.
+   Verified: `bbot --dry-run -m wafw00f,sslcert,paramminer_getparams` -> 15/15 modules,
+   exit 0, as uid 10001 (this was broken before the size work, not because of it).
+
+3. Playwright installs `--only-shell`: @playwright/mcp is launched with --headless
+   (db/db.go), which runs chromium-headless-shell, so the 422 MB headed Chromium was
+   never started. Headless launch verified (renders a page, ffmpeg kept for video).
+
+4. npm and pip caches are removed in the layer that creates them (55 MB + 92 MB).
+
+5. p7zip-full/xz-utils added to the runtime apt list: bbot needs them to unpack the
+   tools it now downloads on first use, and they were previously pulled in only as a
+   side effect of bbot's build-time apt install.
+
+Also adds BBOT-MODULE-DEPS.md: the 40 unhashed distributions bbot pulls on top of
+requirements-bbot.lock (234 MB, newest-compatible resolution, so the set can drift
+between builds), with a script to regenerate it.
+---
+ BBOT-MODULE-DEPS.md         | 67 +++++++++++++++++++++++++++++++++
+ Dockerfile                  | 75 ++++++++++++++++++++++++++++---------
+ HARDENING.md                | 45 +++++++++++++++++++---
+ scripts/bbot-module-deps.py | 20 ++++++++++
+ skills/bbot-recon/SKILL.md  |  6 +++
+ 5 files changed, 190 insertions(+), 23 deletions(-)
+ create mode 100644 BBOT-MODULE-DEPS.md
+ create mode 100755 scripts/bbot-module-deps.py
+
+diff --git a/BBOT-MODULE-DEPS.md b/BBOT-MODULE-DEPS.md
+new file mode 100644
+index 0000000..c01d046
+--- /dev/null
++++ b/BBOT-MODULE-DEPS.md
+@@ -0,0 +1,67 @@
++# bbot module dependencies (the unhashed half of the venv)
++
++`requirements-bbot.lock` pins bbot's own 68 dependencies with SHA-256 hashes. On top of
++that, the Dockerfile runs `bbot -y --install-all-deps`, which pip-installs the
++per-module dependencies bbot discovers at runtime. Those are **not** pinned or hashed:
++pip picks the newest release compatible with each module's constraint, so this list can
++change between builds of the same Dockerfile.
++
++Regenerate after changing `BBOT_VERSION`:
++
++```bash
++docker build --target bbotdeps -t artex-bbotdeps .
++docker run --rm -v "$PWD/requirements-bbot.lock:/tmp/lock:ro" \
++  -v "$PWD/scripts/bbot-module-deps.py:/tmp/gen.py:ro" \
++  --entrypoint /opt/bbot/bin/python artex-bbotdeps /tmp/gen.py
++```
++
++If you need these verified too, generate a second lock with
++`uv pip compile --generate-hashes` from the list below, install it with
++`--require-hashes` right after `requirements-bbot.lock`, and drop
++`--install-all-deps` (then only modules whose deps are in that lock will work).
++
++40 distributions installed by `bbot -y --install-all-deps` beyond the 68 in requirements-bbot.lock
++total: 234 MB
++
++| package | version | MB |
++|---|---|---|
++| `kreuzberg` | 4.4.6 | 91.0 |
++| `numpy` | 2.5.4 | 56.3 |
++| `Django` | 5.2.19 | 23.0 |
++| `SQLAlchemy` | 2.1.8 | 18.2 |
++| `asyncpg` | 0.32.0 | 14.0 |
++| `pypdfium2` | 5.15.0 | 8.9 |
++| `aiokafka` | 0.12.0 | 4.3 |
++| `pymongo` | 4.19.0 | 3.9 |
++| `badsecrets` | 1.2.1 | 3.8 |
++| `multidict` | 7.2.1 | 1.8 |
++| `neo4j` | 6.4.1 | 1.5 |
++| `pytz` | 2026.6 | 1.0 |
++| `propcache` | 0.5.4 | 0.9 |
++| `Werkzeug` | 3.1.9 | 0.8 |
++| `python-whois` | 0.9.6 | 0.5 |
++| `click` | 8.5.1 | 0.4 |
++| `python-dateutil` | 2.9.0.post0 | 0.4 |
++| `yarl` | 1.25.1 | 0.4 |
++| `nats-py` | 2.16.0 | 0.3 |
++| `Flask` | 3.1.3 | 0.3 |
++| `Markdown` | 3.4.4 | 0.3 |
++| `baddns` | 2.4.1 | 0.3 |
++| `aiomysql` | 0.3.2 | 0.2 |
++| `aio-pika` | 9.5.8 | 0.2 |
++| `pamqp` | 3.3.0 | 0.2 |
++| `sqlparse` | 0.6.1 | 0.2 |
++| `PyMySQL` | 1.2.3 | 0.1 |
++| `wafw00f` | 2.3.2 | 0.1 |
++| `aiormq` | 6.9.4 | 0.1 |
++| `sqlmodel` | 0.0.48 | 0.1 |
++| `asgiref` | 3.13.0 | 0.1 |
++| `colorama` | 0.4.6 | 0.1 |
++| `aiosqlite` | 0.22.1 | 0.1 |
++| `PySocks` | 1.7.1 | 0.0 |
++| `itsdangerous` | 2.2.0 | 0.0 |
++| `six` | 1.17.0 | 0.0 |
++| `flask-unsign` | 1.2.1 | 0.0 |
++| `blinker` | 1.9.0 | 0.0 |
++| `pluginbase` | 1.0.1 | 0.0 |
++| `async-timeout` | 5.0.1 | 0.0 |
+diff --git a/Dockerfile b/Dockerfile
+index 32273c5..e921215 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -48,6 +48,48 @@ RUN ARTEX_SKIP_FRONTEND=1 \
+     ARTEX_BUILD_VERSION="${ARTEX_VERSION}" \
+     bash ./build.sh --target "${TARGETOS:-linux}/${TARGETARCH:-amd64}"
+ 
++# ------------------------------------------------------------------ bbot ---
++# bbot's own dependency installer (`--install-all-deps`) does three things that
++# must not land in the runtime image: it apt-installs build tooling (gcc, make,
++# libssl-dev, 7z, xz), it pip-installs per-module Python deps (django, numpy,
++# kreuzberg, ...), and its dry-run downloads bbot's per-module *tool* cache
++# (a second Chromium, a second Node, jadx, trufflehog, gowitness — ~1.5 GB) into
++# $HOME/.bbot. Only the venv is carried into the final image, so the tooling and
++# the tool cache are built here and thrown away. They were also unreadable at
++# runtime: they lived in /root, and the container runs as uid 10001.
++FROM python:3.12.16-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df AS bbotdeps
++ARG BBOT_VERSION=3.0.2
++
++# Prepare bbot under the *runtime* user's home, not root's. bbot records completed
++# core-dependency installs in ~/.bbot/cache/<hash> and skips the installer when the
++# marker is there; without it the installer shells out to `sudo` for apt, which does
++# not exist in the runtime image and which bbot does not handle (FileNotFoundError
++# escapes can_sudo_without_password and aborts the scan). Pre-seeding the marker and
++# the ansible collection under /home/artex makes bbot work as uid 10001.
++ENV HOME=/home/artex
++RUN apt-get update && apt-get install -y --no-install-recommends \
++      ca-certificates git curl xz-utils \
++    && rm -rf /var/lib/apt/lists/* \
++    && mkdir -p /home/artex
++COPY requirements-bbot.lock /tmp/requirements-bbot.lock
++RUN set -eux; \
++    python -m venv /opt/bbot; \
++    /opt/bbot/bin/pip install --no-cache-dir --require-hashes -r /tmp/requirements-bbot.lock; \
++    /opt/bbot/bin/python -c 'import bbot, sys; assert bbot.__version__ == sys.argv[1], bbot.__version__' "$BBOT_VERSION"; \
++    rm -f /tmp/requirements-bbot.lock; \
++    ln -s /opt/bbot/bin/bbot /usr/local/bin/bbot; \
++    PIP_NO_CACHE_DIR=1 bbot -y --install-all-deps; \
++    bbot --version >/dev/null; \
++    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness >/dev/null 2>&1 || true; \
++    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness --no-color >/tmp/bbot-dry.log 2>&1 || true; \
++    ! grep -qE "Installing|ERRR|CRITICAL" /tmp/bbot-dry.log || { cat /tmp/bbot-dry.log; exit 1; }; \
++    # Keep the core-dep marker, the ansible collection and the bbot config; drop the
++    # tool cache (~1.5 GB of a second chrome/node/jadx/trufflehog) and run leftovers.
++    # Tools re-download into the same place on first use, as uid 10001.
++    rm -rf /home/artex/.bbot/tools /home/artex/.bbot/temp /home/artex/.bbot/logs \
++           /home/artex/.bbot/scans /home/artex/.ansible/galaxy_cache \
++           /home/artex/.cache /tmp/bbot-dry.log
++
+ # ---------------------------------------------------------------- runtime ---
+ FROM python:3.12.16-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
+ ARG TARGETARCH
+@@ -60,6 +102,7 @@ COPY --from=web /usr/local /usr/local
+ RUN apt-get update && apt-get install -y --no-install-recommends \
+       ca-certificates ripgrep curl wget vim git jq unzip \
+       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
++      p7zip-full xz-utils \
+     && rm -rf /var/lib/apt/lists/* \
+     && node --version && npm --version
+ 
+@@ -144,20 +187,15 @@ RUN set -eux; \
+ # isolate it from the image python, installed from a fully hashed lock
+ # (requirements-bbot.lock, 68 packages, generated for cp312 on amd64 and arm64).
+ # Module dependencies are preinstalled (--install-all-deps) so scans never need pip
+-# at runtime, which would fail under a program's egress allowlist.
+-ARG BBOT_VERSION=3.0.2
+-COPY requirements-bbot.lock /tmp/requirements-bbot.lock
+-RUN set -eux; \
+-    python -m venv /opt/bbot; \
+-    /opt/bbot/bin/pip install --no-cache-dir --require-hashes -r /tmp/requirements-bbot.lock; \
+-    /opt/bbot/bin/python -c 'import bbot, sys; assert bbot.__version__ == sys.argv[1], bbot.__version__' "$BBOT_VERSION"; \
+-    rm -f /tmp/requirements-bbot.lock; \
+-    ln -s /opt/bbot/bin/bbot /usr/local/bin/bbot; \
+-    bbot -y --install-all-deps; \
+-    bbot --version >/dev/null; \
+-    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness >/dev/null 2>&1 || true; \
+-    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness --no-color >/tmp/bbot-dry.log 2>&1 || true; \
+-    ! grep -qE "Installing|ERRR|CRITICAL" /tmp/bbot-dry.log || { cat /tmp/bbot-dry.log; exit 1; }
++# at runtime, which would fail under a program's egress allowlist. Built in the
++# bbotdeps stage above; only the venv is copied, so the build tooling and the
++# build-time tool cache stay out of this image.
++COPY --from=bbotdeps /opt/bbot /opt/bbot
++RUN ln -s /opt/bbot/bin/bbot /usr/local/bin/bbot
++# bbot's prepared home: core-dep marker in .bbot/cache, ansible collection, config.
++COPY --from=bbotdeps /home/artex/.bbot /home/artex/.bbot
++COPY --from=bbotdeps /home/artex/.ansible /home/artex/.ansible
++COPY --from=bbotdeps /home/artex/.config /home/artex/.config
+ 
+ # Preinstall Playwright MCP and CLI (globally) so no npx network download is needed
+ # at runtime. Exact versions, not @latest: @latest makes the image non-reproducible
+@@ -172,8 +210,11 @@ RUN npm install -g --no-fund --no-audit \
+         "@playwright/cli@${PLAYWRIGHT_CLI_VERSION}" \
+         "playwright@${PLAYWRIGHT_VERSION}" \
+     && playwright-cli --help \
+-    && playwright install --with-deps chromium \
+-    && rm -rf /var/lib/apt/lists/*
++    # --only-shell: ARTEX launches @playwright/mcp with --headless (db/db.go), and
++    # headless Chromium runs the chromium-headless-shell build, so the ~420 MB headed
++    # Chromium never starts. Drop it; ffmpeg stays (screenshots/video need it).
++    && playwright install --with-deps --only-shell chromium \
++    && rm -rf /var/lib/apt/lists/* /root/.npm /root/.cache/node
+ 
+ WORKDIR /app
+ # Binary compiled from source in the build stage above.
+@@ -192,7 +233,7 @@ RUN chmod +x /app/artex /app/start.sh /app/docker-entrypoint.sh \
+ RUN groupadd --gid 10001 artex \
+     && useradd --uid 10001 --gid artex --home-dir /home/artex --create-home \
+                --shell /usr/sbin/nologin artex \
+-    && chown -R artex:artex /app/data /app/keys \
++    && chown -R artex:artex /app/data /app/keys /home/artex \
+     && chmod -R a+rX /ms-playwright
+ COPY skills/ /app/skills/
+ VOLUME ["/app/data", "/app/keys"]
+diff --git a/HARDENING.md b/HARDENING.md
+index f515258..9e9e601 100644
+--- a/HARDENING.md
++++ b/HARDENING.md
+@@ -23,7 +23,7 @@ scripts/verify-provenance.sh upstream v0.3.15 e6ec56999175509551a1e43a3ee3b053d0
+ scripts/verify-provenance.sh release BaaRai/ARTEX v0.5.1 artex-0.5.1-linux-amd64.zip
+ ```
+ 
+-## Changes in this fork (6)
++## Changes in this fork (8)
+ 
+ 1. **Tool archives are hash-pinned.** nuclei, httpx, subfinder, katana, ffuf and dalfox
+    are verified against a SHA-256 pinned in the `Dockerfile` for both `amd64` and
+@@ -48,14 +48,42 @@ scripts/verify-provenance.sh release BaaRai/ARTEX v0.5.1 artex-0.5.1-linux-amd64
+    architectures) is installed with `pip --require-hashes`, and the import is checked
+    against `BBOT_VERSION`. Verified by installing the lock under `--require-hashes` on
+    CPython 3.12 before committing it.
++7. **`bbot` is built in a throwaway stage** — `--install-all-deps` apt-installs gcc,
++   make, libssl-dev, 7z and xz, pip-installs 40 module packages (django, numpy,
++   kreuzberg, …), and its dry-run downloads bbot's per-module *tool* cache into `$HOME`
++   (a second Chromium 693 MB, a second Node 164 MB, jadx 110 MB, trufflehog 34 MB,
++   gowitness 47 MB — 1.5 GB total). Only `/opt/bbot` plus bbot's config, the core-dep
++   marker and the ansible collection are copied into the runtime image; the build
++   tooling and the tool cache never are. They were also unusable before: they lived in
++   `/root`, which uid 10001 cannot read, so the image carried 1.5 GB that nothing could
++   use. Tools download into `/home/artex/.bbot/tools` on first use instead.
++8. **`bbot` works unprivileged** — bbot's installer skips core deps when
++   `~/.bbot/cache/<hash>` exists and otherwise shells out to `sudo`, which the runtime
++   image does not have (bbot only catches `CalledProcessError`, so the missing binary
++   aborted the scan with `FileNotFoundError`). The build seeds the marker, the
++   `bbot.yml`/`secrets.yml` config and the ansible collection under `/home/artex`, and
++   the runtime image hands that directory to uid 10001, so bbot starts without root.
++   Verified: `bbot --dry-run -m wafw00f,sslcert,paramminer_getparams` → `Setup
++   succeeded for 13/13 modules`, exit 0, as uid 10001.
+ 
+ ## Not covered (know what this does not protect against)
+ 
+ - `apt-get` packages are version-constrained by the digest-pinned base image but are not
+   individually hash-pinned; Debian security updates will change them between builds.
+-- `bbot -y --install-all-deps` installs bbot's *module* dependencies into the venv after
+-  the hashed lock. Those extra packages are not hash-verified. If that matters, drop
+-  the flag and preinstall only the modules you use from your own locked list.
++- `bbot -y --install-all-deps` installs 40 distributions beyond the 68 in the hashed
++  lock: django 5.2.19, numpy 2.5.4, kreuzberg 4.4.6, sqlalchemy 2.1.8, zstandard,
++  asyncpg, pymysql, pymongo, aiokafka, neo4j, baddns, badsecrets, flask-unsign,
++  wafw00f, … (≈234 MB of the 508 MB venv). They are **unpinned and unhashed**: pip
++  resolves the newest compatible release at build time, so two builds of this
++  Dockerfile can ship different code. The set is recorded in
++  `BBOT-MODULE-DEPS.md`; pinning it would mean generating a second hashed lock
++  for those 40 (plus their transitive deps) and dropping the flag for the modules you
++  use.
++- bbot's per-module tool cache is no longer baked in. On first use each module
++  downloads its tools (chromium, node, jadx, trufflehog, gowitness, …) into
++  `/home/artex/.bbot/tools`, up to ~1.5 GB. That needs egress to the vendors' release
++  hosts; under a strict allowlist, either allow those hosts or pre-seed the directory
++  as uid 10001 and accept the image size.
+ - The image build is not byte-reproducible (apt/pip/npm fetch at build time, and
+   `npm ci` resolves from the lockfile's registry URLs).
+ - PID 1 of the container starts as root for the `/app/data` + `/app/keys` ownership
+@@ -83,5 +111,10 @@ offering them the corresponding source of the modified version.
+ 
+ > Status: the image builds and runs. Verified locally with `docker build -t artex:local .`
+ > plus `docker compose up -d --no-build` (postgres + artex healthy, UI answering on
+-> 127.0.0.1:8787), and the pinned hashes/images were resolved during that build. Re-verify
+-> after changing any version pin: `docker build --progress=plain -t artex:local .`.
++> 127.0.0.1:8787, bbot 3.0.2 running as uid 10001). Re-verify after changing any version
++> pin: `docker build --progress=plain -t artex:local .`
++>
++> Size: 6.49 GB → 2.87 GB (`docker system df -v`). Removed: 1.5 GB of bbot build junk in
++> `/root` (tool cache + gcc/make/libssl-dev/ansible installs), 92 MB pip cache, 55 MB npm
++> cache, and the 422 MB headed Chromium that `--headless` never starts. `/usr` also drops
++> from 1.70 GB to 1.12 GB now that bbot's build tooling stays in the `bbotdeps` stage.
+diff --git a/scripts/bbot-module-deps.py b/scripts/bbot-module-deps.py
+new file mode 100755
+index 0000000..6bcfbb7
+--- /dev/null
++++ b/scripts/bbot-module-deps.py
+@@ -0,0 +1,20 @@
++import importlib.metadata as m, re, sys
++lock = set()
++for line in open('/tmp/lock'):
++    mm = re.match(r'^([A-Za-z0-9._-]+)==', line.strip())
++    if mm: lock.add(re.sub(r'[_.]', '-', mm.group(1)).lower())
++rows = []
++for d in m.distributions():
++    name = d.metadata['Name']; norm = re.sub(r'[_.]', '-', name).lower()
++    if norm in lock: continue
++    try: size = sum((f.size or 0) for f in (d.files or [])) / 1e6
++    except Exception: size = 0.0
++    rows.append((norm, name, d.version, size))
++rows.sort()
++print(f"{len(rows)} distributions installed by `bbot -y --install-all-deps` beyond the 68 in requirements-bbot.lock")
++print(f"total: {sum(r[3] for r in rows):.0f} MB")
++print()
++print("| package | version | MB |")
++print("|---|---|---|")
++for norm, name, ver, size in sorted(rows, key=lambda r: -r[3]):
++    print(f"| `{name}` | {ver} | {size:.1f} |")
+diff --git a/skills/bbot-recon/SKILL.md b/skills/bbot-recon/SKILL.md
+index bebe8ef..040ce93 100755
+--- a/skills/bbot-recon/SKILL.md
++++ b/skills/bbot-recon/SKILL.md
+@@ -12,6 +12,12 @@ JSON. Use it for breadth. Keep the single-purpose tools (subfinder, httpx,
+ katana, ffuf, nuclei) when you need exact control over individual requests or
+ a single host.
+ 
++Python module dependencies are preinstalled; bbot's per-module *tools* are not.
++The first scan that uses a module downloads that tool into
++`/home/artex/.bbot/tools` (Chromium, node, jadx, trufflehog, … — up to ~1.5 GB,
++once per container). Run `/usr/local/bin/bbot --version` once after startup to
++confirm the config is usable before a scan that has a time budget.
++
+ ## Hard gates (read before running anything)
+ 
+ 1. **Authorization**: targets and seeds must be inside the task's authorized

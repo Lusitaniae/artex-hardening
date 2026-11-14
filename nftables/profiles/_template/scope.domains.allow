@@ -1,0 +1,15 @@
+# Name-level scope for THIS assignment. One domain per line.
+# Copy nftables/profiles/_template to nftables/profiles/<engagement>/ first.
+#
+# Rendered into proxy/squid.conf as `acl scope_domains dstdomain .<name>` by
+#   ./scripts/render-squid-scope.sh --profile <engagement>
+# A leading dot is added for you; no scheme, no path, no wildcard.
+#
+# This list names the client. It is engagement-confidential in the same way
+# scope.allow is, and it is gitignored for that reason.
+#
+# EMPTY IS THE DEFAULT AND MEANS DENY: no names, no name-level reach.
+#
+# Example (replace):
+# client.example        # apex + www — client scope doc §1
+# docs.client.example   # GitBook-backed docs, CNAME to Cloudflare

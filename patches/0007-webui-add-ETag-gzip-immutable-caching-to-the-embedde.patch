@@ -1,0 +1,386 @@
+From 1250320cbe568b92ca81791b362b642dec975ff9 Mon Sep 17 00:00:00 2001
+From: hardening <hardening@example.invalid>
+Date: Sun, 8 Nov 2026 08:25:37 +0000
+Subject: [PATCH 7/9] webui: add ETag + gzip + immutable caching to the
+ embedded SPA handler
+
+The embedded Next export ships ~1.55 MB of JS/CSS. Files read from embed.FS
+report a zero modtime, so http.ServeFileFS emitted no Last-Modified and nothing
+set an ETag: the browser had no validator and re-downloaded the whole bundle on
+every page load. The handler also ignored Accept-Encoding, so those bytes went
+out uncompressed.
+
+Measured from a 211 ms-RTT link: 17 assets / 1,554,053 B, 8.57 s serialised,
+1.98 s at 6-way parallelism, 0.28 MB/s per SSH stream.
+
+Now each asset is digested (sha256, 16 bytes, quoted strong ETag) and, for
+compressible types over 1 KiB, gzipped once at BestCompression and cached in
+memory (~450 KB total). Responses carry Vary: Accept-Encoding and honour
+gzip;q=0. /_next/static/* gets public, max-age=31536000, immutable because
+Next content-hashes those filenames; HTML gets no-cache so a rebuild is never
+served stale. Range and HEAD still work (http.ServeContent underneath).
+
+Stdlib only, no new module dependencies.
+---
+ server/webui_assets.go      | 156 ++++++++++++++++++++++++++++++++++++
+ server/webui_assets_test.go | 140 ++++++++++++++++++++++++++++++++
+ server/webui_embed.go       |  27 +++----
+ 3 files changed, 306 insertions(+), 17 deletions(-)
+ create mode 100644 server/webui_assets.go
+ create mode 100644 server/webui_assets_test.go
+
+diff --git a/server/webui_assets.go b/server/webui_assets.go
+new file mode 100644
+index 0000000..e4258f5
+--- /dev/null
++++ b/server/webui_assets.go
+@@ -0,0 +1,156 @@
++package server
++
++// Static-asset serving for the embedded SPA.
++//
++// The Next.js export ships ~1.55 MB of JS/CSS. Two properties made that painful
++// on a high-latency link (measured from the lab: 211 ms RTT, 0.28 MB/s per SSH
++// stream, 17 assets totalling 1,554,053 B):
++//
++//   - no compression: the handler served raw bytes and ignored Accept-Encoding,
++//     so 1.55 MB crossed the wire where ~450 KB would do;
++//   - no cache validators: files read out of embed.FS report a zero modtime, so
++//     http.ServeContent emitted no Last-Modified, and nothing set an ETag
++//     either. With no validator the browser re-downloaded the whole bundle on
++//     every page load.
++//
++// Assets are digested and gzipped once, lazily, and held in memory (~450 KB
++// total). Content-hashed Next chunks get immutable caching; HTML stays
++// revalidate-only so a rebuild is never served stale.
++
++import (
++	"bytes"
++	"compress/gzip"
++	"crypto/sha256"
++	"encoding/hex"
++	"io/fs"
++	"mime"
++	"net/http"
++	"path"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++const (
++	assetGzipMinBytes = 1024
++	immutablePrefix   = "_next/static/"
++	immutableValue    = "public, max-age=31536000, immutable"
++	revalidateValue   = "no-cache"
++)
++
++// assetEntry is one embedded file, digested and pre-compressed.
++type assetEntry struct {
++	raw   []byte
++	gz    []byte
++	etag  string
++	ctype string
++}
++
++// assetCache holds entries keyed by path within the embedded tree.
++var assetCache sync.Map
++
++func loadAsset(fsys fs.FS, name string) (*assetEntry, error) {
++	if v, ok := assetCache.Load(name); ok {
++		return v.(*assetEntry), nil
++	}
++	raw, err := fs.ReadFile(fsys, name)
++	if err != nil {
++		return nil, err
++	}
++	e := &assetEntry{raw: raw, ctype: assetContentType(name)}
++	sum := sha256.Sum256(raw)
++	e.etag = `"` + hex.EncodeToString(sum[:16]) + `"`
++	if len(raw) >= assetGzipMinBytes && assetCompressible(e.ctype) {
++		var buf bytes.Buffer
++		if zw, zerr := gzip.NewWriterLevel(&buf, gzip.BestCompression); zerr == nil {
++			_, _ = zw.Write(raw)
++			_ = zw.Close()
++			if buf.Len() < len(raw) {
++				e.gz = buf.Bytes()
++			}
++		}
++	}
++	actual, _ := assetCache.LoadOrStore(name, e)
++	return actual.(*assetEntry), nil
++}
++
++func assetContentType(name string) string {
++	if ct := mime.TypeByExtension(path.Ext(name)); ct != "" {
++		return ct
++	}
++	return "application/octet-stream"
++}
++
++func assetCompressible(ctype string) bool {
++	base := ctype
++	if i := strings.IndexByte(base, ';'); i >= 0 {
++		base = base[:i]
++	}
++	switch base {
++	case "text/html", "text/css", "text/javascript", "application/javascript",
++		"application/json", "image/svg+xml", "text/plain":
++		return true
++	}
++	return false
++}
++
++// gzipAccepted reports whether the client accepts gzip with a non-zero q-value.
++func gzipAccepted(r *http.Request) bool {
++	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
++		fields := strings.Split(strings.TrimSpace(part), ";")
++		coding := strings.ToLower(strings.TrimSpace(fields[0]))
++		if coding != "gzip" && coding != "*" {
++			continue
++		}
++		q := 1.0
++		for _, attr := range fields[1:] {
++			attr = strings.TrimSpace(attr)
++			if strings.HasPrefix(attr, "q=") {
++				if v, err := strconv.ParseFloat(strings.TrimPrefix(attr, "q="), 64); err == nil {
++					q = v
++				}
++			}
++		}
++		if q > 0 {
++			return true
++		}
++	}
++	return false
++}
++
++// serveWebAsset writes name from fsys with validators, and gzipped when the
++// client accepts it. Returns false when the file is absent or unreadable so the
++// caller can try the next candidate path.
++func serveWebAsset(w http.ResponseWriter, r *http.Request, fsys fs.FS, name string, immutable bool) bool {
++	e, err := loadAsset(fsys, name)
++	if err != nil {
++		return false
++	}
++	h := w.Header()
++	h.Set("Content-Type", e.ctype)
++	h.Set("ETag", e.etag)
++	h.Add("Vary", "Accept-Encoding")
++	if immutable {
++		h.Set("Cache-Control", immutableValue)
++	} else {
++		h.Set("Cache-Control", revalidateValue)
++	}
++	body := e.raw
++	if e.gz != nil && gzipAccepted(r) {
++		h.Set("Content-Encoding", "gzip")
++		body = e.gz
++	}
++	// ServeContent handles Range, HEAD and If-None-Match against our ETag.
++	// Zero modtime: content-hashed assets have no meaningful mtime and we do
++	// not want a second, weaker validator in play.
++	http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(body))
++	return true
++}
++
++// webuiImmutable reports whether name may be cached forever. Only the
++// content-hashed Next build output qualifies; HTML must revalidate so a rebuild
++// is never served stale.
++func webuiImmutable(name string) bool {
++	return strings.HasPrefix(name, immutablePrefix)
++}
+diff --git a/server/webui_assets_test.go b/server/webui_assets_test.go
+new file mode 100644
+index 0000000..aa6fe2b
+--- /dev/null
++++ b/server/webui_assets_test.go
+@@ -0,0 +1,140 @@
++package server
++
++import (
++	"bytes"
++	"compress/gzip"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"testing/fstest"
++)
++
++func webuiTestFS() fstest.MapFS {
++	return fstest.MapFS{
++		"_next/static/chunks/app.js": {Data: bytes.Repeat([]byte("const a=1;\n"), 400)},
++		"index.html":                  {Data: []byte("<html><body>hi</body></html>")},
++	}
++}
++
++const testAssetPath = "_next/static/chunks/app.js"
++
++func TestServeWebAssetGzipAndValidators(t *testing.T) {
++	fsys := webuiTestFS()
++
++	req := httptest.NewRequest(http.MethodGet, "/"+testAssetPath, nil)
++	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
++	rec := httptest.NewRecorder()
++	if !serveWebAsset(rec, req, fsys, testAssetPath, true) {
++		t.Fatal("asset not served")
++	}
++	res := rec.Result()
++	if got := res.Header.Get("Content-Encoding"); got != "gzip" {
++		t.Errorf("Content-Encoding = %q, want gzip", got)
++	}
++	if got := res.Header.Get("Cache-Control"); got != immutableValue {
++		t.Errorf("Cache-Control = %q, want %q", got, immutableValue)
++	}
++	etag := res.Header.Get("ETag")
++	if etag == "" {
++		t.Error("ETag missing")
++	}
++	if !strings.Contains(res.Header.Get("Vary"), "Accept-Encoding") {
++		t.Error("Vary missing Accept-Encoding")
++	}
++
++	body, err := io.ReadAll(res.Body)
++	if err != nil {
++		t.Fatalf("read body: %v", err)
++	}
++	zr, err := gzip.NewReader(bytes.NewReader(body))
++	if err != nil {
++		t.Fatalf("body is not gzip: %v", err)
++	}
++	got, err := io.ReadAll(zr)
++	if err != nil {
++		t.Fatalf("gunzip: %v", err)
++	}
++	if want := fsys[testAssetPath].Data; !bytes.Equal(got, want) {
++		t.Errorf("round-trip mismatch: got %d bytes, want %d", len(got), len(want))
++	}
++	if len(body) >= len(fsys[testAssetPath].Data)/2 {
++		t.Errorf("compression ineffective: %d of %d bytes", len(body), len(fsys[testAssetPath].Data))
++	}
++
++	// Same asset carries the same ETag on a second, unrelated request.
++	rec2 := httptest.NewRecorder()
++	serveWebAsset(rec2, httptest.NewRequest(http.MethodGet, "/"+testAssetPath, nil), fsys, testAssetPath, true)
++	if got := rec2.Result().Header.Get("ETag"); got != etag {
++		t.Errorf("ETag not stable: %q vs %q", got, etag)
++	}
++}
++
++func TestServeWebAssetConditional(t *testing.T) {
++	fsys := webuiTestFS()
++
++	rec := httptest.NewRecorder()
++	serveWebAsset(rec, httptest.NewRequest(http.MethodGet, "/"+testAssetPath, nil), fsys, testAssetPath, true)
++	etag := rec.Result().Header.Get("ETag")
++	if etag == "" {
++		t.Fatal("no ETag to revalidate against")
++	}
++
++	req := httptest.NewRequest(http.MethodGet, "/"+testAssetPath, nil)
++	req.Header.Set("If-None-Match", etag)
++	rec304 := httptest.NewRecorder()
++	serveWebAsset(rec304, req, fsys, testAssetPath, true)
++	if rec304.Code != http.StatusNotModified {
++		t.Errorf("revalidation status = %d, want 304", rec304.Code)
++	}
++	if n := rec304.Body.Len(); n != 0 {
++		t.Errorf("304 carried %d body bytes, want 0", n)
++	}
++}
++
++func TestServeWebAssetHonoursEncodingAndCachePolicy(t *testing.T) {
++	fsys := webuiTestFS()
++
++	// A client that does not accept gzip gets the raw bytes.
++	req := httptest.NewRequest(http.MethodGet, "/"+testAssetPath, nil)
++	req.Header.Set("Accept-Encoding", "identity")
++	rec := httptest.NewRecorder()
++	serveWebAsset(rec, req, fsys, testAssetPath, true)
++	if got := rec.Result().Header.Get("Content-Encoding"); got != "" {
++		t.Errorf("Content-Encoding = %q, want empty for identity", got)
++	}
++	body, _ := io.ReadAll(rec.Result().Body)
++	if want := fsys[testAssetPath].Data; !bytes.Equal(body, want) {
++		t.Errorf("identity body mismatch: %d vs %d bytes", len(body), len(want))
++	}
++
++	// gzip;q=0 must be treated as a refusal.
++	req0 := httptest.NewRequest(http.MethodGet, "/"+testAssetPath, nil)
++	req0.Header.Set("Accept-Encoding", "gzip;q=0")
++	rec0 := httptest.NewRecorder()
++	serveWebAsset(rec0, req0, fsys, testAssetPath, true)
++	if got := rec0.Result().Header.Get("Content-Encoding"); got != "" {
++		t.Errorf("gzip;q=0 still compressed (Content-Encoding=%q)", got)
++	}
++
++	// HTML is revalidate-only, never immutable.
++	recHTML := httptest.NewRecorder()
++	serveWebAsset(recHTML, httptest.NewRequest(http.MethodGet, "/index.html", nil), fsys, "index.html", false)
++	if got := recHTML.Result().Header.Get("Cache-Control"); got != revalidateValue {
++		t.Errorf("html Cache-Control = %q, want %q", got, revalidateValue)
++	}
++
++	if webuiImmutable("index.html") {
++		t.Error("index.html must not be immutable")
++	}
++	if !webuiImmutable("_next/static/chunks/app.js") {
++		t.Error("_next/static assets must be immutable")
++	}
++}
++
++func TestServeWebAssetMissing(t *testing.T) {
++	if serveWebAsset(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/nope.js", nil), webuiTestFS(), "nope.js", false) {
++		t.Error("missing asset reported as served")
++	}
++}
+diff --git a/server/webui_embed.go b/server/webui_embed.go
+index e9d480a..0a6030b 100644
+--- a/server/webui_embed.go
++++ b/server/webui_embed.go
+@@ -21,6 +21,12 @@ var webuiDist embed.FS
+ // webuiHandler serves the embedded SPA. Public (no JWT) — auth is enforced
+ // client-side and on /api. Serves the exported per-route index.html files and
+ // falls back to index.html so client-side routing still resolves unknown paths.
++//
++// Responses carry an ETag and, for the content-hashed Next chunks, immutable
++// caching; compressible bodies are gzipped when the client accepts it. See
++// webui_assets.go for why (embed.FS has no mtime, so the previous
++// http.ServeFileFS path emitted no validator at all and re-sent ~1.5 MB of
++// assets on every load).
+ func (s *Server) webuiHandler() http.Handler {
+ 	root, err := fs.Sub(webuiDist, "webui/dist")
+ 	if err != nil {
+@@ -36,25 +42,12 @@ func (s *Server) webuiHandler() http.Handler {
+ 		// 3) <p>.html
+ 		// 4) SPA fallback → index.html (hand it to client-side routing)
+ 		for _, cand := range []string{p, p + "/index.html", p + ".html"} {
+-			if serveFileIfExists(w, r, root, cand) {
++			if serveWebAsset(w, r, root, cand, webuiImmutable(cand)) {
+ 				return
+ 			}
+ 		}
+-		http.ServeFileFS(w, r, root, "index.html")
++		if !serveWebAsset(w, r, root, "index.html", false) {
++			http.NotFound(w, r)
++		}
+ 	})
+ }
+-
+-// serveFileIfExists serves name from fsys when it exists as a regular file.
+-func serveFileIfExists(w http.ResponseWriter, r *http.Request, fsys fs.FS, name string) bool {
+-	f, err := fsys.Open(name)
+-	if err != nil {
+-		return false
+-	}
+-	st, statErr := f.Stat()
+-	_ = f.Close()
+-	if statErr != nil || st.IsDir() {
+-		return false
+-	}
+-	http.ServeFileFS(w, r, fsys, name)
+-	return true
+-}

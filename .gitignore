@@ -1,0 +1,45 @@
+# secrets and per-deployment state — never commit
+.env.hardened
+.env
+
+# build and run artifacts
+build/
+artifacts/
+patches/*.patch.bak
+*.log
+*.pcap
+*.csv
+
+# operator scratch / deployment state — never commit
+server.txt
+# upstream ARTEX release workflow, kept here for review only. It is not part of the
+# hardening artifact, and it publishes `latest` images on a v* tag (SECURITY-REVIEW.md F6).
+rel.yml
+# internal decision log: contains engagement findings + operator state.
+# the publishable counterpart is SECURITY-REVIEW.md.
+STATUS.md
+.env.bak*
+*.bak.*
+*.bak2.*
+__pycache__/
+*.pyc
+
+# populated firewall inputs (derived from client scope docs — client-confidential)
+nftables/scope.allow
+nftables/scope.domains.allow
+nftables/llm.allow
+nftables/resolvers.allow
+
+# per-engagement profiles: populated allowlists are client-confidential;
+# the _template stays tracked so a fresh clone can start an assignment.
+nftables/profiles/*/*.allow
+nftables/profiles/*/*.bak.*
+!nftables/profiles/_template/*.allow
+
+# engagement output that must never land in a repo
+evidence/
+screenshots/
+loot/
+
+# per-engagement CDN edge choices (derived from client hosting)
+nftables/edge.allow
