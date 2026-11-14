@@ -39,6 +39,7 @@ WPScan stage.
 | Dependency patch is a republish, not a modification | `replace github.com/Autumn-27/norma => github.com/BaaRai/Norma v0.4.4`; `diff -r` against `Autumn-27/norma@v0.4.4` is **empty, byte-identical** | high |
 | Egress in the observed window went only to allowlisted or denied destinations | `artex-access.log`, §5 | medium — one-day window |
 | Build is reproducible from source | tree hash match; bases digest-pinned; every downloaded tool SHA-256-verified; `pip --require-hashes`; `npm ci --ignore-scripts` | high |
+| No operator-directed dependency | §7 — 4 advisories across 356 packages, all parser/decompression classes; none is a network callback, persistence mechanism, or post-install hook | medium |
 | The deployed commit passes upstream's own test suite | GitHub Actions `ci` run 43564726771 on `b95a57f` — success, 9m47s (Go tests against a real Postgres service) | high |
 
 ## 3. Findings
@@ -161,10 +162,45 @@ It is not: *"this build cannot exfiltrate data."*
    clean in every check here and still be malicious on a path not exercised.
 3. **The model provider.** DeepSeek receives target data under its own terms (ZDR is a
    contractual claim, not a verifiable control). See `STATUS.md` §7.3.
-4. **Full dependency audit.** `go.sum` hashes are verified at build, but no CVE/SBOM scan
-   of the full module graph is recorded here.
+4. **Reachability.** §7 is version-level, not symbol-level. No `govulncheck` call-graph
+   pass has been run, so an advisory present in a dependency may not be reachable.
 
-## 7. Reproduce
+## 7. Supply chain
+
+`tools/sbom-scan.py` queries the OSV database for every package in the build: 53 Go
+modules (`go.mod`), 68 PyPI distributions (the hash-pinned bbot lock), and 235 Debian
+bookworm packages read from the running image. Reproduce with
+`ARTEX_HOST=root@<deploy-host> ./tools/sbom-scan.py`.
+
+**Go and PyPI** — 4 modules carry advisories:
+
+| ecosystem | package | version | advisory |
+|---|---|---|---|
+| Go | `github.com/klauspost/compress` | v1.18.6 | GO-2026-5841 (s2 OOB read), GO-2026-6865 (panic on two-block frames), GHSA-259r-337f-4rfw (integer overflow → OOB write) |
+| Go | `github.com/andybalholm/brotli` | v1.2.1 | GO-2026-6888 (excessive allocation on crafted streams) |
+| Go | `golang.org/x/crypto` | v0.58.0 | GO-2026-5932 (`openpgp` unmaintained — only if that package is imported) |
+| PyPI | `dnspython` | 2.8.0 | GHSA-vvf4-9x63-8xvv, GHSA-45c3-73f7-pv4m (excessive CPU/memory in name parsing) |
+
+These are **module-level**, not call-graph: OSV says the version is affected, not that the
+vulnerable symbol is reachable. Two of them are nonetheless worth taking seriously here,
+because of what this tool *does*: an agent that scans targets parses attacker-controlled
+bytes by design. `brotli` and `compress/s2` sit on the HTTP-response path, and `dnspython`
+sits on the DNS path that bbot drives. A crafted response from an in-scope host reaches
+them. That is a different risk profile from a web app behind a form.
+
+**Debian** — 142 tracker rows, and they should not be read as 142 vulnerabilities. OSV's
+Debian data records security-tracker entries; an entry carrying `introduced: 0` and no
+`fixed` event — the ordinary no-DSA case — is reported as affecting every version. Verified
+on one: `DEBIAN-CVE-2024-2379` for `curl` asserts `introduced: 0` for `Debian:12` with no
+fix recorded, although bookworm shipped a fix in a point release. That is the mechanism
+behind most of the 142.
+
+**Verdict:** nothing operator-directed, and nothing that changes §2. Actionable next step,
+in priority order: `govulncheck` for call-graph precision (it would clear `openpgp`
+immediately), bump `klauspost/compress` past the s2 fixes, and run the base image through a
+distro-aware scanner (`trivy`/`grype` with the Debian feed) rather than OSV.
+
+## 8. Reproduce
 
 ```bash
 # deployed tree, from the fork + published patches
@@ -182,7 +218,7 @@ grep -rnoE '"[A-Za-z0-9+/]{200,}={0,2}"' --include=*.go .
 awk '{print $7}' /var/log/squid/artex-access.log | sed -E 's|^[a-z]+://||; s|:[0-9]+.*$||' | sort | uniq -c | sort -rn
 ```
 
-## 8. Publishable statement
+## 9. Publishable statement
 
 Use this, verbatim, wherever this work is shared:
 

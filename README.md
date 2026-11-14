@@ -69,6 +69,7 @@ scripts/
   teardown.sh                   destroy containers, volume, firewall state
 tools/
   model-ab.py                   refusal/thrash/cost harness for model selection
+  sbom-scan.py                  OSV query for Go + PyPI + Debian packages in the build
 ```
 
 ---
