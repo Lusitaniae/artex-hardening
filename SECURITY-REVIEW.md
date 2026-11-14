@@ -15,7 +15,7 @@ Reviewed 2026-11-14. Read-only: no file on the deployment host was modified.
 | Item | Value |
 |---|---|
 | Fork | `github.com/BaaRai/ARTEX` (`origin/main` = `a908e1e`, release v0.5.1) |
-| Deployed source | `origin/main` + 10 local commits = `b95a57f` |
+| Deployed source | `origin/main` + 10 local commits = `b95a57f`. The published repo has one further commit, `316aa94` (release-workflow neutralisation, §F6), which is not part of the deployed build |
 | Source tree hash | `2bd1acc4ca4bcb821a4a5add67ebd3876b647312` — reproduced byte-for-byte by applying `patches/0001…0010` to `a908e1e`. (Committed HEAD alone is `a8f3b53` = tree `d06c63de`; the 10th commit is the uncommitted deployment delta that was present when the image was built.) |
 | Running image | `artex:local-20261109` = `sha256:0bd35306…448cc89f`, built 2026-11-09T03:55:23Z |
 | Database | `postgres:16-alpine` |
@@ -97,13 +97,15 @@ finding: the build trusts a mirror's path for the module that holds the LLM clie
 executor and hooks. Options: drop the `replace` and require the upstream path, or vendor
 the module into the tree.
 
-### F6 — `rel.yml` makes any fork the publisher of `latest` (medium *if you publish*)
+### F6 — `release.yml` made any fork the publisher of `latest` — **neutralised**
 
-On any `v*` tag push the workflow builds 5-platform zips, cuts a GitHub Release, and pushes
-multi-arch images to `ghcr.io` tagged **`latest`**, using tag-pinned (not SHA-pinned)
-actions. If this repo is published as a fork, whoever pushes a tag becomes the publisher
-of exactly the artifact this baseline tells operators never to pull. Disable the workflow or
-pin every action to a commit SHA before publishing.
+Upstream's `.github/workflows/release.yml` triggered on `push: tags: ["v*"]`: it built
+5-platform release zips, cut a GitHub Release, and pushed multi-arch images to `ghcr.io`
+tagged **`latest`**, using tag-pinned (not SHA-pinned) actions.
+
+In the published fork this is fixed at `316aa94` — the trigger is now `workflow_dispatch`
+only, so nothing publishes on a tag. The deployed build is the parent of that commit and is
+unaffected. Remaining optional hardening: pin each `uses:` to a commit SHA.
 
 ## 4. Network surface, file by file
 
