@@ -30,7 +30,7 @@ else
 fi
 
 say "verify volumes are gone"
-LEFT="$(docker volume ls -q | grep -E 'artex-hardened_(db_data|artex_state)' || true)"
+LEFT="$(docker volume ls -q | grep -E 'artex-hardened_(db_data|artex_data|artex_keys)' || true)"
 if [ -z "$LEFT" ]; then
   echo "  no artex volumes remain on this host"
 else

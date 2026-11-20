@@ -48,21 +48,32 @@ fi
 PW="$(env_get POSTGRES_PASSWORD)"
 if [ "${#PW}" -ge 24 ]; then ok "postgres password length ${#PW}"; else bad "postgres password too short (${#PW} chars, want >=24)"; fi
 
-TOKEN="$(env_get ARTEX_SETUP_TOKEN)"
-ADMINPW="$(env_get ARTEX_ADMIN_PASSWORD)"
-if [ -n "$TOKEN" ] || [ -n "$ADMINPW" ]; then
-  ok "first-run protection set ($([ -n "$TOKEN" ] && echo setup_token || echo admin_password))"
+# ARTEX reads no setup token or admin password from the environment: the server
+# generates a one-time token at startup and prints it to its log. The control that
+# keeps a first visitor out is the loopback-only publish checked below.
+SECRET="$(env_get ARTEX_SECRET_KEY)"
+KEYS_VOL=0
+grep -q 'artex_keys:/app/keys' "$COMPOSE_FILE" && KEYS_VOL=1
+if [ -n "$SECRET" ] && [ "${SECRET:0:6}" != "CHANGE" ]; then
+  if [ "${#SECRET}" -ge 32 ]; then ok "ARTEX_SECRET_KEY set (${#SECRET} chars)"
+  else bad "ARTEX_SECRET_KEY too short (${#SECRET} chars, want >=32 bytes base64/hex)"; fi
+elif [ "$KEYS_VOL" = "1" ]; then
+  warn "ARTEX_SECRET_KEY unset — the generated keys/secret.key on artex_keys is the key; back up that volume with db_data"
 else
-  bad "no ARTEX_SETUP_TOKEN or ARTEX_ADMIN_PASSWORD — first visitor to the UI owns the instance"
+  bad "ARTEX_SECRET_KEY unset and no artex_keys volume — secret.key is lost on recreate, startup then refuses, and the encrypted credentials are unrecoverable"
 fi
-[ -n "$TOKEN" ] && [ "${#TOKEN}" -lt 32 ] && warn "setup token is ${#TOKEN} chars; 64 hex is better"
+[ "$KEYS_VOL" = "1" ] && ok "artex_keys volume mounted (jwt.key + secret.key survive a recreate)" \
+  || bad "no artex_keys volume — secret.key is lost on recreate and startup will refuse once rows are encrypted"
 
 APIKEY="$(env_get ARTEX_LLM_API_KEY)"
 if [ -n "$APIKEY" ] && [ "${APIKEY:0:4}" != "CHANGE" ]; then ok "LLM API key present"; else bad "ARTEX_LLM_API_KEY not set"; fi
 
 say "exposure"
-BIND="$(env_get ARTEX_BIND)"
-[ "$BIND" = "127.0.0.1" ] && ok "ARTEX_BIND=127.0.0.1" || bad "ARTEX_BIND=$BIND — must be 127.0.0.1; use an SSH/WireGuard tunnel"
+if grep -qE '^[[:space:]]*-[[:space:]]*"127\.0\.0\.1:8787:8787"' "$COMPOSE_FILE"; then
+  ok "8787 published on 127.0.0.1 only"
+else
+  bad "8787 is not published as 127.0.0.1:8787 — check the ports block (auditd: the app has no ARTEX_BIND variable)"
+fi
 
 if grep -qE '^\s*-\s*"0\.0\.0\.0:' "$COMPOSE_FILE"; then
   bad "compose publishes on 0.0.0.0"
@@ -72,8 +83,13 @@ fi
 grep -q '8788:' "$COMPOSE_FILE" && bad "port 8788 (traffic recorder) is published — it captures cookies and tokens" \
   || ok "8788 not published"
 
-CORS="$(env_get ARTEX_CORS_ORIGINS)"
-[ -z "$CORS" ] && ok "CORS origins empty (same-origin UI)" || warn "CORS widened to: $CORS"
+say "prompt hardening"
+UB="$(env_get ARTEX_UNTRUSTED_BOUNDARY)"
+case "$(printf '%s' "${UB:-}" | tr '[:upper:]' '[:lower:]')" in
+  ""|1|true|on|yes) ok "untrusted-output boundary on" ;;
+  0|false|off|no)   bad "ARTEX_UNTRUSTED_BOUNDARY disabled — target output is no longer framed as data" ;;
+  *)                warn "ARTEX_UNTRUSTED_BOUNDARY=$UB (unrecognised; upstream treats it as on)" ;;
+esac
 
 say "images"
 IMG="$(env_get ARTEX_IMAGE)"

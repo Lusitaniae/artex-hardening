@@ -228,3 +228,68 @@ Use this, verbatim, wherever this work is shared:
 > egress matched the allowlist or was denied. **Upstream `Autumn-27/ARTEX` is unreachable,
 > so this is a review of the fork's deployed surface, not a comparison against upstream —
 > provenance remains unverifiable.**
+
+---
+
+## 10. Addendum — upstream update re-validation (2026-11-20)
+
+§1–§9 above describe the **deployed** build (`a908e1e` + 10 commits, v0.5.1). This addendum
+covers a different question: before moving the fork onto the source repo's current head, does
+anything in the 487-commit delta act against the operator?
+
+| Item | Value |
+|---|---|
+| Source repo | `github.com/BaaRai/ARTEX` (`origin/main`), HEAD `ab40834`, 2026-11-20 |
+| Delta reviewed | `a908e1e..ab40834` — 487 commits, 650 files, +79,150 / −6,549 |
+| Release position | `ab40834` is **403 commits past `v0.6.0`** (the newest tag) — unreleased code |
+| Merge result | fork `update/upstream-2026-11-20`, merge commit `13c6b43` |
+| Method | commit-level triage; diff of every added network primitive; `go.mod`/`go.sum` delta; migration review; release-workflow diff; mirror diff of `BaaRai/Norma v0.4.4..v0.4.11` |
+
+**Answer: no operator-directed behaviour was introduced.** No telemetry SDK, no obfuscated
+payload, no `curl | sh`, no `ADD <url>`, no destructive migration, no new runtime dependency
+outside `aws-sdk-go-v2` (S3 archives), `gorilla/websocket` (stream capture) and `mvdan.cc/sh/v3`
+(shell parsing for intercept argv rules).
+
+New network paths, all opt-in and all denied by the default egress allowlist:
+
+| Path | Trigger | Notes |
+|---|---|---|
+| `api.github.com` | `ARTEX_UPDATE_CHECK=1` | update banner; sends only a `User-Agent`; off by default, pinned off in the hardened compose |
+| `api.keenable.ai` | web search backend selected + key | new search provider (`b452b13`, Norma PR #8) |
+| S3 endpoints | cold-task archive configured | credentials from settings, encrypted at rest |
+
+### Finding status against `ab40834`
+
+| Finding | Status |
+|---|---|
+| F1 — app-level scope enforcement removed | **unchanged.** `guard/guard.go` still says the RoE mechanism was removed. Upstream added an opt-in target gate (`1f4cb65`, `78f92f4`), but it is **off by default and API-only**, and it is name-only behind a proxy. The egress allowlist remains the only boundary. |
+| F2 — `mcphttp` has no internal-address guard | **still open.** Four `NewRequest*` sites in `mcphttp/client.go`, still no `Control` hook. |
+| F3 — `Access-Control-Allow-Origin: *` | **unchanged** (`server/server.go:4521`). Still masked by no `Allow-Credentials` and a `Content-Type`-only preflight. |
+| F4 — `api.pdtm.sh` runtime update channel | **unchanged.** Still not referenced in-tree; still denied by the allowlist. |
+| F5 — privileged dependency from a third-party mirror | **weakened.** The merge bumps `replace github.com/Autumn-27/norma => github.com/BaaRai/Norma` from v0.4.4 to **v0.4.11**. Upstream `Autumn-27/norma` publishes only up to **v0.4.4**, so v0.4.5–v0.4.11 exist **only on the mirror** and can no longer be compared byte-for-byte. The mirror's `v0.4.4` object (`70d12d9…`) is identical to upstream's tag, so the lineage is intact, and the 0.4.4→0.4.11 diff (21 commits) is feature work — untrusted-output boundary, WebFetch dialer/redirect checks, tool-output hardening, English strings, Keenable search — with no obfuscation and no new callback. **Still a provenance gap: vendor the module or hash-pin a review of it.** |
+| F6 — release workflow publishes `latest` | **re-closed in the merge (`13c6b43`).** Upstream reintroduced `push: tags: ["v*"]`; the resolution keeps `workflow_dispatch` only and takes upstream's SBOM, build-provenance attestation and CHANGELOG body. Release and Docker-push jobs remain gated on `github.event_name == 'push'`, so they are unreachable. |
+
+### What the operator must do differently
+
+1. **`ARTEX_SECRET_KEY` is now mandatory in practice.** Secrets are encrypted at rest with
+   AES-256-GCM. Startup *refuses* when encrypted rows exist and the key is missing; losing the
+   key loses the credentials. The hardened compose sets `ARTEX_JWT_KEY_DIR=/app/keys` and mounts
+   the named `artex_keys` volume; put it in the same backup as `db_data`.
+2. **The untrusted-output boundary is on by default.** Pinned to `1` in the compose file;
+   `preflight.sh` fails if disabled.
+3. **The first-run token is not an environment variable.** ARTEX never read
+   `ARTEX_SETUP_TOKEN` at any version; the real control is a startup-generated one-time token
+   printed to the log, plus the loopback-only publish. README, `.env.hardened.example` and
+   `preflight.sh` have been corrected.
+4. **Data and keys live in named volumes** (`artex_data:/app/data`, `artex_keys:/app/keys`).
+   The previous `ARTEX_STATE_DIR=/opt/artex/state` mount was inert.
+5. **Upstream isolation is not active under our image.** It runs as uid 10001, so the new
+   `-exec-uid` drop degrades to a log line (it requires a root server). Keeping non-root means
+   `secret.key` is readable by a compromised agent process: at-rest encryption protects database
+   dumps and backups, not a live container compromise.
+
+### Still unverified at the time of writing
+
+- Image build and `go test ./...` (no Go toolchain on the review host).
+- Upgrade of a copy of the engagement database through the 8 migrations and the secrets backfill.
+- OSV re-scan (the dependency set changed), digest re-pin, and regeneration of `patches/`.

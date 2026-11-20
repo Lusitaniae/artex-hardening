@@ -20,7 +20,7 @@ What this baseline defends against:
 | The agent (or a prompt-injected target) pivots out of the lab | Default-deny egress on a dedicated bridge; only in-scope ranges and one LLM path |
 | Cloud metadata credential theft (`169.254.169.254`) | Explicit drop, in every ruleset, before any accept |
 | The web UI / traffic proxy is exposed to the internet | Loopback-only publish; input-chain drop as defence-in-depth; SSH/WireGuard only |
-| First-visitor admin takeover | `ARTEX_SETUP_TOKEN` / `ARTEX_ADMIN_PASSWORD` mandatory, validated in preflight |
+| First-visitor admin takeover | Loopback-only publish; one-time setup token generated at startup and printed to the container log (there is no env var for it) |
 | Silent self-update pulls new code mid-engagement | `pull_policy: never`, no registry egress, digest-pinned images |
 | Container escapes via caps | `cap_drop: ALL`, `no-new-privileges`, no privileged mode, pids/mem limits |
 | Cross-container lateral movement (agent → Postgres) | Only 5432 accepted, everything else between lab hosts dropped |
@@ -82,13 +82,32 @@ commit you pinned — each one is a place a fork can diverge:
 
 | # | Assumption | Where | If wrong |
 |---|---|---|---|
-| A1 | Image entrypoint runs `start.sh` and honours `ARTEX_BIND`, `ARTEX_PG_DSN`, `ARTEX_LLM_*` | compose, env | Fall back to explicit `command:`; re-check the Dockerfile `ENTRYPOINT`/`CMD` |
+| A1 | Image entrypoint runs `start.sh` and honours `ARTEX_PG_DSN`, `ARTEX_LLM_*`, `ARTEX_JWT_KEY_DIR`; the listen address comes from `CMD -addr :8787` and compose publishes it on loopback | compose, env | Fall back to explicit `command:`; re-check the Dockerfile `ENTRYPOINT`/`CMD` |
 | A2 | App listens on 8787 (API/UI) and 8788 (traffic-recording proxy) | compose | Adjust published port; never publish 8788 |
-| A3 | Writes state outside `/tmp` (evidence, screenshots) to a configurable path | compose volume | Mount the real writable path or the container will run out of disk mid-run |
+| A3 | Writes state to `/app/data` (`<base>/data`) and keys to `/app/keys`; both are named volumes | compose volumes | Mount both or a recreate loses the traffic index and `secret.key` |
 | A4 | Postgres is reachable as a service named `db` on 5432 | compose DSN | Adjust DSN |
 | A5 | `ARTEX_LLM_PROXY` accepts an HTTP forward proxy for model calls | env | Use `--direct` egress mode with pinned IPs (fragile if the provider rotates) |
 | A6 | `max_tokens` must be ≤16384 for some OpenAI-compatible models | §7 | Requests fail 400 `max_tokens is too large` |
 | A7 | The `guard` package enforces target scope | §5 | **FALSE for the pinned build — confirmed 2026-11-08.** `guard/guard.go`: *"The RoE authorization-scope mechanism was removed; a replacement may be added later."* The egress allowlist is the *only* scope enforcement; there is none at the app layer. |
+
+### What changed in the 2026-11-20 upstream merge
+
+The fork moved from `a908e1e` (v0.5.1) to `ab40834` (487 commits, post-v0.6.0). Four changes
+matter to an operator:
+
+- **Secrets are encrypted at rest.** `ARTEX_SECRET_KEY` (or `keys/secret.key`) is now required.
+  Startup **refuses** when encrypted rows exist and the key is missing, and losing the key
+  loses the stored credentials. `artex_keys` is a named volume in the compose file; put it in
+  the same backup as `db_data`.
+- **The untrusted-output boundary is on by default.** `docker-compose.hardened.yml` pins it to
+  `1`; `preflight.sh` fails if it is disabled. Expect ~154 bytes per tool result.
+- **The first-run token is not an env var.** It is generated at startup and printed to the log.
+  `preflight.sh` no longer checks for `ARTEX_SETUP_TOKEN` (which ARTEX never read).
+- **Data and keys moved to named volumes** `artex_data:/app/data` and `artex_keys:/app/keys`.
+  The previous `ARTEX_STATE_DIR=/opt/artex/state` mount was inert — the binary never read it.
+
+New opt-in egress paths (all denied by the allowlist unless you add them): `api.keenable.ai`
+(web search), S3 endpoints (cold-task archives), `api.github.com` (update banner, pinned off).
 
 ---
 
@@ -176,9 +195,15 @@ Then reach the UI **only** over a tunnel:
 ssh -N -L 8787:127.0.0.1:8787 ops@vps
 ```
 
-First boot: complete `/setup` with the pinned `ARTEX_SETUP_TOKEN`. If you set
-`ARTEX_ADMIN_PASSWORD` instead, verify login works and then remove both from `.env.hardened`
-(keep the password in your password manager) — the token is single-use, but why leave it.
+First boot: while no admin password is stored, ARTEX generates a one-time setup token and
+prints it to its log. Claim the instance with it:
+
+```bash
+docker compose -f docker-compose.hardened.yml logs artex | grep -F 'Setup token'
+```
+
+The token is cleared once a password is stored. There is no env var for it; the control that
+keeps a first visitor from claiming the instance is the loopback-only publish above.
 
 ### Phase 3 — engage
 
