@@ -47,6 +47,7 @@ What it does **not** defend against, and you should stop pretending otherwise:
 README.md                       this runbook
 LICENSE                         MIT, for the baseline (patches/ stay AGPL-3.0)
 SECURITY-REVIEW.md              operator-impact review of the deployed build (read this first)
+UPSTREAM-PRS.md                 which fork changes go upstream, and which never will
 patches/                        the 10 deployed commits as a patch series against the fork's main
 .env.hardened.example           copy to .env.hardened, fill, chmod 600
 docker-compose.hardened.yml     two services, one bridge, loopback publish only
